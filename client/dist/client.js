@@ -1,10 +1,14 @@
-// dsh-file-edit — static client bundle (web plugin).
+// @justarook1e/dsh-ide-lite — static client bundle (web plugin).
 // Loaded by the client module system as a classic script; registers a factory
 // via window.__ModuleLoader__.load. The factory body runs at materialization;
 // require('react') resolves through the shell's static module table.
+// The registration id MUST equal the package name (the client module system
+// keys its factory table by the boot-graph entry id, which is the package
+// name); the HTTP routes, localStorage keys and slot ids below deliberately
+// keep the stable `dsh-file-edit` runtime identifier.
 // RPC to the host plugin goes through fetch('/dsh-file-edit/api').
 window.__ModuleLoader__.load({
-  id: 'dsh-file-edit',
+  id: '@justarook1e/dsh-ide-lite',
   factory: (require) => {
     const React = require('react')
 
@@ -1004,7 +1008,7 @@ window.__ModuleLoader__.load({
         }
         attachLoop()
         if (typeof console !== 'undefined' && console.info) {
-          console.info('[dsh-file-edit] guard v1.31.0: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click) + direct button attach (setTimeout loop)')
+          console.info('[dsh-file-edit] guard v1.31.1: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click) + direct button attach (setTimeout loop)')
         }
         ctx.effect(() => () => {
           guardDisposed = true
