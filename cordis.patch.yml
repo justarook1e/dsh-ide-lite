@@ -1,7 +1,14 @@
-# dsh-file-edit bundle patch: one plugin row added to the host composition.
-# Applied as a profile bundle layer (declared by dsh.bundle in package.json);
-# the row joins the Loader entry list, mounting the host half and serving
-# lib/client.js into the boot graph.
+# @justarook1e/dsh-ide-lite bundle patch: one plugin row added to the host
+# composition. Applied as a profile bundle layer (declared by dsh.bundle in
+# package.json); the row joins the Loader entry list, mounting the host half and
+# serving client/dist/client.js into the boot graph.
+#
+# `name` must be a module specifier Node can resolve from the profile root, so
+# it carries the full package name. The row `id` is deliberately kept as the
+# stable `dsh-file-edit` runtime identifier: the HTTP routes
+# (/dsh-file-edit/...), the state directory (~/.dsh/dsh-file-edit-state/) and
+# the client's localStorage keys all key off it, so existing review state,
+# baselines and undo history carry over from the pre-npm releases unchanged.
 - insert:
     - id: dsh-file-edit
-      name: dsh-file-edit
+      name: '@justarook1e/dsh-ide-lite'
