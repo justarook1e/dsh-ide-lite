@@ -1,5 +1,5 @@
 {
-  "name": "dsh-file-edit",
+  "name": "@justarook1e/dsh-ide-lite",
   "version": "1.31.0",
   "description": "Workspace file browser with agent-change review (accept/reject + undo), full user editing (undo/redo, save, auto-save), diff view and rendered markdown, plus an integrated terminal view with auto-detected project run targets (static host+client plugin)",
   "type": "module",
@@ -20,5 +20,37 @@
       ]
     }
   },
-  "private": true
+  "files": [
+    "host/",
+    "client/dist/",
+    "cordis.patch.yml",
+    "README.md",
+    "THIRD_PARTY_LICENSES.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis",
+    "plugin",
+    "dsh-plugin",
+    "ide",
+    "file-editor",
+    "file-tree",
+    "diff",
+    "code-review",
+    "terminal"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/justarook1e/dsh-ide-lite.git"
+  },
+  "homepage": "https://github.com/justarook1e/dsh-ide-lite#readme",
+  "bugs": {
+    "url": "https://github.com/justarook1e/dsh-ide-lite/issues"
+  },
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  }
 }

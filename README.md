@@ -1,4 +1,8 @@
-# dsh-file-edit
+# dsh-ide-lite
+
+> **本仓库是原 `dsh-file-edit` 的迁移与续作。** 旧仓库 [justarook1e/dsh-file-edit](https://github.com/justarook1e/dsh-file-edit) **已停止维护**（仅保留历史与重定向），请以本仓库为准。自本仓库起改用 npm 发版：`@justarook1e/dsh-ide-lite`。
+>
+> 迁移**只改分发包名**，插件在运行期的标识符（HTTP 路由 `/dsh-file-edit/...`、状态目录 `~/.dsh/dsh-file-edit-state/`、localStorage 键前缀、槽位 id）**保持不变**——因此从旧版升级**不需要任何数据迁移**，此前的审阅状态、基线快照与撤销记录继续有效。
 
 > 本项目全部代码由 DeepSeek-V4-Pro 与 DeepSeek-V4-Flash 生成。
 
@@ -77,17 +81,17 @@ DSH WebUI 工作区文件插件，核心功能有三块：
 需要本机已装 DSH（`~/.dsh/profiles/web` 存在）且能访问 GitHub。PowerShell 中执行：
 
 ```powershell
-irm https://raw.githubusercontent.com/justarook1e/dsh-file-edit/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/justarook1e/dsh-ide-lite/main/install.ps1 | iex
 ```
 
 完成后：**重启 DSH**（加载宿主插件与挂载项），然后 **Ctrl+F5 刷新页面**（加载客户端 bundle）。
 
 > 备选（clone 方式，凭据走 Git Credential Manager）：
-> `git clone https://github.com/justarook1e/dsh-file-edit.git "$env:TEMP\dsh-file-edit"; & "$env:TEMP\dsh-file-edit\install.ps1"`
+> `git clone https://github.com/justarook1e/dsh-ide-lite.git "$env:TEMP\dsh-ide-lite"; & "$env:TEMP\dsh-ide-lite\install.ps1"`
 
 ## 手动安装
 
-1. 把本仓库的 `package.json`、`host/`、`client/` 复制到 `~/.dsh/profiles/web/node_modules/dsh-file-edit/`；
+1. 把本仓库的 `package.json`、`host/`、`client/` 复制到 `~/.dsh/profiles/web/node_modules/@justarook1e/dsh-ide-lite/`；
 2. 在 `~/.dsh/profiles/web/cordis.patch.yml` 末尾追加：
 
    ```yaml
@@ -98,33 +102,39 @@ irm https://raw.githubusercontent.com/justarook1e/dsh-file-edit/main/install.ps1
 
 3. 重启 DSH + Ctrl+F5 刷新页面。
 
-`install.ps1` 做的正是这两步（幂等，可重复执行；`-Uninstall` 反向移除）。
+`install.ps1` 走的是 `dsh plugin add` 托管安装流程（幂等，可重复执行；`-Uninstall` 反向移除），因此上面的手动复制步骤只在无法使用该流程时才需要。
 
 ## 更新
 
-再次运行安装脚本即可（幂等，覆盖已安装的包）：
+改用 npm 发版后，推荐用与 `@dingyi222666/dsh-session-notification` 完全相同的方式升级（可指定版本号，也可用 `@latest`）：
 
 ```powershell
-irm https://raw.githubusercontent.com/justarook1e/dsh-file-edit/main/install.ps1 | iex
+pnpm dsh plugin --profile web add @justarook1e/dsh-ide-lite@latest
 ```
 
-或（clone 方式）：`cd "$env:TEMP\dsh-file-edit"; git pull; & .\install.ps1`
+或仍用安装脚本（幂等，覆盖已安装的包）：
+
+```powershell
+irm https://raw.githubusercontent.com/justarook1e/dsh-ide-lite/main/install.ps1 | iex
+```
+
+或（clone 方式）：`cd "$env:TEMP\dsh-ide-lite"; git pull; & .\install.ps1`
 
 ## 卸载
 
 ```powershell
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/justarook1e/dsh-file-edit/main/install.ps1))) -Uninstall
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/justarook1e/dsh-ide-lite/main/install.ps1))) -Uninstall
 ```
 
-或（clone 方式）：`& "$env:TEMP\dsh-file-edit\install.ps1" -Uninstall`
+或（clone 方式）：`& "$env:TEMP\dsh-ide-lite\install.ps1" -Uninstall`
 
-或手动删除 `node_modules/dsh-file-edit/` 与 patch 里的 insert 块。重启后生效。
+或手动删除 `node_modules/@justarook1e/dsh-ide-lite/` 与 patch 里的 insert 块。重启后生效。
 
 ## 仓库结构
 
 ```
-dsh-file-edit/
-├── package.json          # dsh.client: {platform:'web'} + exports["./client"]
+dsh-ide-lite/
+├── package.json          # name: @justarook1e/dsh-ide-lite；dsh.client: {platform:'web'} + exports["./client"]
 ├── host/index.mjs        # 宿主插件：扫描/基线/diff/接受拒绝/终端/运行识别/RPC（POST /dsh-file-edit/api）
 ├── client/dist/client.js # 浏览器 bundle（__ModuleLoader__.load + factory）
 └── install.ps1           # 一键安装/卸载脚本
