@@ -26,6 +26,8 @@
     "cordis.patch.yml",
     "README.md",
     "THIRD_PARTY_LICENSES.md",
+    "PROJECT.md",
+    "CONSTITUTION.md",
     "LICENSE"
   ],
   "keywords": [
