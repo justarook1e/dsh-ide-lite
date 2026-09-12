@@ -2,5 +2,10 @@
 dsh-file-edit-plugin-status.md
 diff-test.py
 
+# DEV.md is the local development handover doc: it carries absolute paths and
+# machine-specific notes, so it stays out of the public repo. npm already
+# excludes it via the `files` whitelist in package.json.
+DEV.md
+
 # Throwaway verification harnesses (node .verify/check-client.mjs)
 .verify/
