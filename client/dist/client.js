@@ -1008,7 +1008,7 @@ window.__ModuleLoader__.load({
         }
         attachLoop()
         if (typeof console !== 'undefined' && console.info) {
-          console.info('[dsh-file-edit] guard v1.31.1: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click) + direct button attach (setTimeout loop)')
+          console.info('[dsh-file-edit] guard v1.32.0: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click) + direct button attach (setTimeout loop)')
         }
         ctx.effect(() => () => {
           guardDisposed = true
@@ -1069,9 +1069,12 @@ window.__ModuleLoader__.load({
           '.dsh-fe-bar { width:100%; max-width:var(--dsh-composer-card-max-width); margin:0 auto; box-sizing:border-box; }',
           // Inline line editor: context + hunk-new lines are editable; hunk
           // old (deleted) lines are read-only but selectable for copy.
+          // v1.32.0: no row hover tint and no click focus ring any more — the
+          // editor should look identical whether or not the pointer/caret is
+          // on a line (the caret itself is the only editing affordance). The
+          // row hover highlight and the clicked line's inset border are gone;
+          // text selection is drawn by .dsh-fe-sel instead.
           '.dsh-fe-tx-edit { cursor:text; outline:none; min-height:1.35em; border-radius:2px; }',
-          '.dsh-fe-line .dsh-fe-tx-edit:hover { background:color-mix(in srgb, var(--dsw-alias-label-secondary) 8%, transparent); }',
-          '.dsh-fe-tx-edit:focus { background:color-mix(in srgb, var(--dsw-alias-label-secondary) 10%, transparent); box-shadow:inset 0 0 0 1px color-mix(in srgb, var(--dsw-alias-label-secondary) 40%, transparent); }',
           '.dsh-fe-tx-ro { user-select:text; opacity:.85; }',
           // ---- v1.4 UI pass: decision glyphs + workbench detailing ----
           // Square icon buttons: the accept/reject gesture language.
@@ -1252,13 +1255,15 @@ window.__ModuleLoader__.load({
           // Every hover highlight now fades on the same .12s ease curve
           // (matching the icon buttons) instead of snapping on. Covers the
           // modified-files bar rows plus the remaining plugin controls that
-          // highlighted instantly: tree refresh, tab close, diff jump,
-          // inline-edit line hover/focus and the hunk hover outline.
+          // highlighted instantly: tree refresh, tab close, diff jump and the
+          // hunk hover outline. The inline editor's own hover/focus chrome was
+          // removed in v1.32.0, so its rule now only carries the text color
+          // fade used by the selection layer.
           '.dsh-fe-file-row { transition:background .12s ease; }',
           '.dsh-fe-secbtn { transition:background .12s ease,color .12s ease; }',
           '.dsh-fe-tab-x { transition:background .12s ease,color .12s ease; }',
           '.dsh-fe-jump-btn { transition:background .12s ease,color .12s ease; }',
-          '.dsh-fe-tx-edit { transition:background .12s ease,box-shadow .12s ease; }',
+          '.dsh-fe-tx-edit { transition:color .12s ease; }',
           // Hunk outline: transparent at rest, fades to the hover tint. The
           // current-hunk marker needs a two-class selector to win over the
           // rest-state transparent outline (same-specificity single-class
@@ -1467,6 +1472,35 @@ window.__ModuleLoader__.load({
           // styles may restrict it; the contentEditable spans stay selectable
           // regardless, and the explicit rule keeps read-only rows too).
           '.dsh-fe-diff, .dsh-fe-code, .dsh-fe-line, .dsh-fe-txwrap, .dsh-fe-txwrap .dsh-fe-tx { user-select:text; -webkit-user-select:text; }',
+          // ---- v1.32.0: editor-grade selection layer ----
+          // A per-line contentEditable clamps the browser's own drag gesture
+          // to the row it started in, so cross-line selection could never be
+          // done natively. The editor now owns the gesture (see selCtl) and
+          // paints the result here: one absolutely positioned tint per
+          // selected line fragment. The layer is pinned to the scrollport's
+          // padding box (left/top 0 inside the positioned `.dsh-fe-diff`), so
+          // fragment rects can be written in plain viewport coordinates and
+          // horizontal overflow is clipped by the layer itself instead of
+          // needing the scroll offsets. Painted above the rows and their
+          // sticky gutters, below the sticky header stack (2–6) so scrolling
+          // headers still cover it; pointer-events:none keeps clicks and
+          // drags on the text underneath.
+          // v1.32.1: the layer spans the scrollport, NOT a zero-height strip.
+          // With `height:0; overflow:hidden` every fragment painted at
+          // top = (rowTop − scrollportTop) fell outside the layer's own clip box
+          // and was never drawn — the drag looked like it did nothing even
+          // though the model selection was correct. Measured: 0 of the
+          // fragments survived the clip.
+          // `bottom:0` makes the layer exactly the scrollport's padding box, so
+          // a fragment's viewport coordinates can be written to left/top
+          // unchanged. pointer-events:none keeps clicks on the text; the
+          // scrollport now supplies the containing block (see .dsh-fe-diff).
+          '.dsh-fe-sel { position:absolute; top:0; left:0; right:0; bottom:0; z-index:30; overflow:hidden; pointer-events:none; }',
+          // The layer now spans the whole scrollport, so it must not inherit
+          // layout from .dsh-fe-diff — an auto overflow here would give the
+          // layer its own scrollbar. EXTRA_CSS lands after the block above.
+          '.dsh-fe-diff > .dsh-fe-sel { display:block; overflow:hidden; }',
+          '.dsh-fe-sel-seg { position:absolute; background:color-mix(in srgb, var(--dsw-alias-state-business-primary, var(--dsw-alias-label-secondary)) 30%, transparent); border-radius:2px; }',
           // Search pill: input + match counter + up/down arrows share ONE
           // background (the pill) so the controls read as an integrated
           // search box; it pins to the left of the diff jump pill in the
@@ -1562,7 +1596,7 @@ window.__ModuleLoader__.load({
           if (styleEl) return
           styleEl = document.createElement('style')
           styleEl.setAttribute('data-plugin', 'dsh-file-edit')
-          styleEl.textContent = `\n.dsh-fe-btn { border:1px solid var(--dsw-alias-border-l1); background:transparent; border-radius:6px; padding:2px 8px; font-size:12px; cursor:pointer; color:inherit; }\n.dsh-fe-btn:hover { background:color-mix(in srgb, var(--dsw-alias-label-secondary) 12%, transparent); }\n.dsh-fe-btn-ok { color:var(--dsw-alias-state-success-primary); border-color:color-mix(in srgb, var(--dsw-alias-state-success-primary) 55%, transparent); }\n.dsh-fe-btn-ok:hover { background:color-mix(in srgb, var(--dsw-alias-state-success-primary) 12%, transparent); }\n.dsh-fe-btn-no { color:var(--dsw-alias-state-error-primary); border-color:color-mix(in srgb, var(--dsw-alias-state-error-primary) 55%, transparent); }\n.dsh-fe-btn-no:hover { background:color-mix(in srgb, var(--dsw-alias-state-error-primary) 10%, transparent); }\n.dsh-fe-bar { display:flex; flex-direction:column; gap:4px; padding:8px 10px; border:1px solid var(--dsw-alias-border-l1); border-radius:10px; background:var(--dsw-alias-bg-layer-2); }\n.dsh-fe-bar-head { display:flex; align-items:center; gap:8px; font-weight:600; font-size:13px; flex-wrap:wrap; }\n.dsh-fe-spacer { flex:1; }\n.dsh-fe-file-row { display:flex; align-items:center; gap:8px; padding:3px 6px; border-radius:6px; font-size:12.5px; }\n.dsh-fe-file-row:hover { background:color-mix(in srgb, var(--dsw-alias-label-secondary) 10%, transparent); }\n.dsh-fe-path { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; cursor:pointer; font-family:ui-monospace,Consolas,monospace; }\n.dsh-fe-chip { font-size:11px; padding:1px 6px; border-radius:8px; border:1px solid var(--dsw-alias-border-l1); color:var(--dsw-alias-label-secondary); white-space:nowrap; }\n.dsh-fe-chip-add { color:var(--dsw-alias-state-success-primary); border-color:color-mix(in srgb, var(--dsw-alias-state-success-primary) 55%, transparent); }\n.dsh-fe-chip-del { color:var(--dsw-alias-state-error-primary); border-color:color-mix(in srgb, var(--dsw-alias-state-error-primary) 55%, transparent); }\n.dsh-fe-stats { color:var(--dsw-alias-label-secondary); font-size:11.5px; white-space:nowrap; }\n.dsh-fe-viewer { display:flex; flex-direction:column; border:1px solid var(--dsw-alias-border-l1); border-radius:10px; background:var(--dsw-alias-bg-layer-1); color:var(--dsw-alias-label-primary); height:100%; }\n.dsh-fe-filetabs { display:flex; align-items:center; gap:4px; padding:4px 6px; border-bottom:1px solid var(--dsw-alias-border-l1); overflow-x:auto; flex:none; }\n.dsh-fe-filetab { display:flex; align-items:center; gap:5px; padding:3px 8px; border:1px solid var(--dsw-alias-border-l1); border-radius:7px; font-size:12px; color:var(--dsw-alias-label-secondary); white-space:nowrap; cursor:pointer; }\n.dsh-fe-filetab:hover { color:var(--dsw-alias-label-primary); }\n.dsh-fe-filetab-on { background:var(--dsw-alias-bg-base); color:var(--dsw-alias-label-primary); }\n.dsh-fe-tab-x { border:none; background:transparent; cursor:pointer; color:var(--dsw-alias-label-secondary); border-radius:4px; padding:0 4px; font-size:11px; }\n.dsh-fe-tab-x:hover { background:color-mix(in srgb, var(--dsw-alias-label-secondary) 18%, transparent); color:var(--dsw-alias-label-primary); }\n.dsh-fe-diff { overflow:auto; flex:1; font-family:ui-monospace,'Cascadia Code',Consolas,monospace; font-size:12.5px; line-height:1.5; }\n.dsh-fe-toolbar { display:flex; align-items:center; gap:8px; padding:6px 10px; border-bottom:1px solid var(--dsw-alias-border-l1); font-size:12.5px; flex-wrap:wrap; }\n.dsh-fe-code { display:flex; flex-direction:column; min-width:max-content; }\n.dsh-fe-line { display:flex; }\n.dsh-fe-ln { width:4ch; flex:none; text-align:right; padding-right:8px; color:var(--dsw-alias-label-secondary); user-select:none; background:color-mix(in srgb, var(--dsw-alias-label-secondary) 6%, transparent); }\n.dsh-fe-tx { white-space:pre; padding-right:16px; }\n.dsh-fe-old { background:color-mix(in srgb, var(--dsw-alias-state-error-primary) 16%, transparent); }\n.dsh-fe-new { background:color-mix(in srgb, var(--dsw-alias-state-success-primary) 16%, transparent); }\n.dsh-fe-hunk { position:relative; margin:2px 0; border-radius:4px; }\n.dsh-fe-hunk:hover { outline:1px solid color-mix(in srgb, var(--dsw-alias-label-secondary) 40%, transparent); }\n.dsh-fe-hunk-head { position:sticky; left:0; display:flex; align-items:center; gap:6px; padding:2px 8px; font-size:11.5px; color:var(--dsw-alias-label-secondary); background:color-mix(in srgb, var(--dsw-alias-label-secondary) 10%, transparent); }\n.dsh-fe-msg { padding:10px; color:var(--dsw-alias-label-secondary); font-size:12.5px; }\n.dsh-fe-err { padding:4px 10px; color:var(--dsw-alias-state-error-primary); font-size:12px; }\n.dsh-fe-wsroot { display:flex; flex-direction:column; height:100%; overflow:hidden; background:var(--dsw-specific-sidebar-fill); }\n.dsh-fe-wshead { display:flex; align-items:center; gap:8px; padding:6px 10px; font-weight:600; font-size:13px; border-bottom:1px solid var(--dsw-alias-border-l1); }\n.dsh-fe-wslist { flex:1; overflow:auto; padding:4px 0; }\n.dsh-fe-ws-item { padding:3px 4px; border-radius:6px; }\n.dsh-fe-ws-row { display:flex; align-items:center; gap:5px; padding:4px 8px; cursor:pointer; border-radius:6px; font-size:13px; white-space:nowrap; }\n.dsh-fe-ws-row:hover { background:color-mix(in srgb, var(--dsw-alias-label-secondary) 10%, transparent); }\n.dsh-fe-ws-row-open { background:color-mix(in srgb, var(--dsw-alias-label-secondary) 12%, transparent); }\n.dsh-fe-chev { width:14px; flex:none; text-align:center; color:var(--dsw-alias-label-secondary); }\n.dsh-fe-ws-name { flex:1; overflow:hidden; text-overflow:ellipsis; }\n.dsh-fe-sec { display:flex; align-items:center; gap:5px; padding:3px 8px 3px 22px; cursor:pointer; font-size:12.5px; color:var(--dsw-alias-label-secondary); border-radius:6px; white-space:nowrap; }\n.dsh-fe-sec:hover { background:color-mix(in srgb, var(--dsw-alias-label-secondary) 10%, transparent); }\n.dsh-fe-sec-open { color:var(--dsw-alias-label-primary); font-weight:600; }\n.dsh-fe-sess { display:flex; align-items:center; gap:6px; padding:3px 8px 3px 40px; cursor:pointer; font-size:12.5px; border-radius:6px; white-space:nowrap; }\n.dsh-fe-sess:hover { background:color-mix(in srgb, var(--dsw-alias-label-secondary) 10%, transparent); }\n.dsh-fe-sess-cur { font-weight:600; }\n.dsh-fe-sess-name { flex:1; overflow:hidden; text-overflow:ellipsis; }\n.dsh-fe-dot { width:7px; height:7px; border-radius:50%; flex:none; background:transparent; }\n.dsh-fe-dot-run { background:var(--dsw-alias-state-warn-primary); }\n.dsh-fe-dot-done { background:var(--dsw-alias-state-success-primary); }\n.dsh-fe-newbtn { border:1px dashed var(--dsw-alias-border-l1); background:transparent; color:var(--dsw-alias-label-secondary); border-radius:6px; margin:2px 8px 2px 40px; padding:2px 8px; font-size:12px; cursor:pointer; }\n.dsh-fe-newbtn:hover { color:var(--dsw-alias-label-primary); background:color-mix(in srgb, var(--dsw-alias-label-secondary) 10%, transparent); }\n.dsh-fe-children { margin-left:14px; }\n.dsh-fe-row { display:flex; align-items:center; gap:4px; padding:2px 8px; cursor:pointer; white-space:nowrap; font-size:12.5px; }\n.dsh-fe-row:hover { background:color-mix(in srgb, var(--dsw-alias-label-secondary) 10%, transparent); }\n.dsh-fe-dir { font-weight:600; }\n.dsh-fe-name { overflow:hidden; text-overflow:ellipsis; }\n.dsh-fe-rail { display:flex; flex-direction:column; align-items:center; gap:6px; padding:8px 0; background:var(--dsw-specific-sidebar-fill); }\n.dsh-fe-railbtn { width:34px; height:34px; display:flex; align-items:center; justify-content:center; font-size:17px; border:none; background:transparent; border-radius:8px; cursor:pointer; }\n.dsh-fe-railbtn:hover { background:color-mix(in srgb, var(--dsw-alias-label-secondary) 14%, transparent); }\n`
+          styleEl.textContent = `\n.dsh-fe-btn { border:1px solid var(--dsw-alias-border-l1); background:transparent; border-radius:6px; padding:2px 8px; font-size:12px; cursor:pointer; color:inherit; }\n.dsh-fe-btn:hover { background:color-mix(in srgb, var(--dsw-alias-label-secondary) 12%, transparent); }\n.dsh-fe-btn-ok { color:var(--dsw-alias-state-success-primary); border-color:color-mix(in srgb, var(--dsw-alias-state-success-primary) 55%, transparent); }\n.dsh-fe-btn-ok:hover { background:color-mix(in srgb, var(--dsw-alias-state-success-primary) 12%, transparent); }\n.dsh-fe-btn-no { color:var(--dsw-alias-state-error-primary); border-color:color-mix(in srgb, var(--dsw-alias-state-error-primary) 55%, transparent); }\n.dsh-fe-btn-no:hover { background:color-mix(in srgb, var(--dsw-alias-state-error-primary) 10%, transparent); }\n.dsh-fe-bar { display:flex; flex-direction:column; gap:4px; padding:8px 10px; border:1px solid var(--dsw-alias-border-l1); border-radius:10px; background:var(--dsw-alias-bg-layer-2); }\n.dsh-fe-bar-head { display:flex; align-items:center; gap:8px; font-weight:600; font-size:13px; flex-wrap:wrap; }\n.dsh-fe-spacer { flex:1; }\n.dsh-fe-file-row { display:flex; align-items:center; gap:8px; padding:3px 6px; border-radius:6px; font-size:12.5px; }\n.dsh-fe-file-row:hover { background:color-mix(in srgb, var(--dsw-alias-label-secondary) 10%, transparent); }\n.dsh-fe-path { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; cursor:pointer; font-family:ui-monospace,Consolas,monospace; }\n.dsh-fe-chip { font-size:11px; padding:1px 6px; border-radius:8px; border:1px solid var(--dsw-alias-border-l1); color:var(--dsw-alias-label-secondary); white-space:nowrap; }\n.dsh-fe-chip-add { color:var(--dsw-alias-state-success-primary); border-color:color-mix(in srgb, var(--dsw-alias-state-success-primary) 55%, transparent); }\n.dsh-fe-chip-del { color:var(--dsw-alias-state-error-primary); border-color:color-mix(in srgb, var(--dsw-alias-state-error-primary) 55%, transparent); }\n.dsh-fe-stats { color:var(--dsw-alias-label-secondary); font-size:11.5px; white-space:nowrap; }\n.dsh-fe-viewer { display:flex; flex-direction:column; border:1px solid var(--dsw-alias-border-l1); border-radius:10px; background:var(--dsw-alias-bg-layer-1); color:var(--dsw-alias-label-primary); height:100%; }\n.dsh-fe-filetabs { display:flex; align-items:center; gap:4px; padding:4px 6px; border-bottom:1px solid var(--dsw-alias-border-l1); overflow-x:auto; flex:none; }\n.dsh-fe-filetab { display:flex; align-items:center; gap:5px; padding:3px 8px; border:1px solid var(--dsw-alias-border-l1); border-radius:7px; font-size:12px; color:var(--dsw-alias-label-secondary); white-space:nowrap; cursor:pointer; }\n.dsh-fe-filetab:hover { color:var(--dsw-alias-label-primary); }\n.dsh-fe-filetab-on { background:var(--dsw-alias-bg-base); color:var(--dsw-alias-label-primary); }\n.dsh-fe-tab-x { border:none; background:transparent; cursor:pointer; color:var(--dsw-alias-label-secondary); border-radius:4px; padding:0 4px; font-size:11px; }\n.dsh-fe-tab-x:hover { background:color-mix(in srgb, var(--dsw-alias-label-secondary) 18%, transparent); color:var(--dsw-alias-label-primary); }\n.dsh-fe-diff { overflow:auto; position:relative; flex:1; font-family:ui-monospace,'Cascadia Code',Consolas,monospace; font-size:12.5px; line-height:1.5; }\n.dsh-fe-toolbar { display:flex; align-items:center; gap:8px; padding:6px 10px; border-bottom:1px solid var(--dsw-alias-border-l1); font-size:12.5px; flex-wrap:wrap; }\n.dsh-fe-code { display:flex; flex-direction:column; min-width:max-content; }\n.dsh-fe-line { display:flex; }\n.dsh-fe-ln { width:4ch; flex:none; text-align:right; padding-right:8px; color:var(--dsw-alias-label-secondary); user-select:none; background:color-mix(in srgb, var(--dsw-alias-label-secondary) 6%, transparent); }\n.dsh-fe-tx { white-space:pre; padding-right:16px; }\n.dsh-fe-old { background:color-mix(in srgb, var(--dsw-alias-state-error-primary) 16%, transparent); }\n.dsh-fe-new { background:color-mix(in srgb, var(--dsw-alias-state-success-primary) 16%, transparent); }\n.dsh-fe-hunk { position:relative; margin:2px 0; border-radius:4px; }\n.dsh-fe-hunk:hover { outline:1px solid color-mix(in srgb, var(--dsw-alias-label-secondary) 40%, transparent); }\n.dsh-fe-hunk-head { position:sticky; left:0; display:flex; align-items:center; gap:6px; padding:2px 8px; font-size:11.5px; color:var(--dsw-alias-label-secondary); background:color-mix(in srgb, var(--dsw-alias-label-secondary) 10%, transparent); }\n.dsh-fe-msg { padding:10px; color:var(--dsw-alias-label-secondary); font-size:12.5px; }\n.dsh-fe-err { padding:4px 10px; color:var(--dsw-alias-state-error-primary); font-size:12px; }\n.dsh-fe-wsroot { display:flex; flex-direction:column; height:100%; overflow:hidden; background:var(--dsw-specific-sidebar-fill); }\n.dsh-fe-wshead { display:flex; align-items:center; gap:8px; padding:6px 10px; font-weight:600; font-size:13px; border-bottom:1px solid var(--dsw-alias-border-l1); }\n.dsh-fe-wslist { flex:1; overflow:auto; padding:4px 0; }\n.dsh-fe-ws-item { padding:3px 4px; border-radius:6px; }\n.dsh-fe-ws-row { display:flex; align-items:center; gap:5px; padding:4px 8px; cursor:pointer; border-radius:6px; font-size:13px; white-space:nowrap; }\n.dsh-fe-ws-row:hover { background:color-mix(in srgb, var(--dsw-alias-label-secondary) 10%, transparent); }\n.dsh-fe-ws-row-open { background:color-mix(in srgb, var(--dsw-alias-label-secondary) 12%, transparent); }\n.dsh-fe-chev { width:14px; flex:none; text-align:center; color:var(--dsw-alias-label-secondary); }\n.dsh-fe-ws-name { flex:1; overflow:hidden; text-overflow:ellipsis; }\n.dsh-fe-sec { display:flex; align-items:center; gap:5px; padding:3px 8px 3px 22px; cursor:pointer; font-size:12.5px; color:var(--dsw-alias-label-secondary); border-radius:6px; white-space:nowrap; }\n.dsh-fe-sec:hover { background:color-mix(in srgb, var(--dsw-alias-label-secondary) 10%, transparent); }\n.dsh-fe-sec-open { color:var(--dsw-alias-label-primary); font-weight:600; }\n.dsh-fe-sess { display:flex; align-items:center; gap:6px; padding:3px 8px 3px 40px; cursor:pointer; font-size:12.5px; border-radius:6px; white-space:nowrap; }\n.dsh-fe-sess:hover { background:color-mix(in srgb, var(--dsw-alias-label-secondary) 10%, transparent); }\n.dsh-fe-sess-cur { font-weight:600; }\n.dsh-fe-sess-name { flex:1; overflow:hidden; text-overflow:ellipsis; }\n.dsh-fe-dot { width:7px; height:7px; border-radius:50%; flex:none; background:transparent; }\n.dsh-fe-dot-run { background:var(--dsw-alias-state-warn-primary); }\n.dsh-fe-dot-done { background:var(--dsw-alias-state-success-primary); }\n.dsh-fe-newbtn { border:1px dashed var(--dsw-alias-border-l1); background:transparent; color:var(--dsw-alias-label-secondary); border-radius:6px; margin:2px 8px 2px 40px; padding:2px 8px; font-size:12px; cursor:pointer; }\n.dsh-fe-newbtn:hover { color:var(--dsw-alias-label-primary); background:color-mix(in srgb, var(--dsw-alias-label-secondary) 10%, transparent); }\n.dsh-fe-children { margin-left:14px; }\n.dsh-fe-row { display:flex; align-items:center; gap:4px; padding:2px 8px; cursor:pointer; white-space:nowrap; font-size:12.5px; }\n.dsh-fe-row:hover { background:color-mix(in srgb, var(--dsw-alias-label-secondary) 10%, transparent); }\n.dsh-fe-dir { font-weight:600; }\n.dsh-fe-name { overflow:hidden; text-overflow:ellipsis; }\n.dsh-fe-rail { display:flex; flex-direction:column; align-items:center; gap:6px; padding:8px 0; background:var(--dsw-specific-sidebar-fill); }\n.dsh-fe-railbtn { width:34px; height:34px; display:flex; align-items:center; justify-content:center; font-size:17px; border:none; background:transparent; border-radius:8px; cursor:pointer; }\n.dsh-fe-railbtn:hover { background:color-mix(in srgb, var(--dsw-alias-label-secondary) 14%, transparent); }\n`
           document.head.append(styleEl)
           styleEl.textContent += EXTRA_CSS
         }
@@ -4444,6 +4478,10 @@ window.__ModuleLoader__.load({
           const diffRef = React.useState({ node: null })[0]
           const scrollGate = React.useState({ pending: false })[0]
           const editingRef = React.useState({ idx: null })[0]
+          // v1.32.0: the selection engine's state + layer handles live with
+          // the other per-pane refs (see selState / selLayerRef below, right
+          // before `saveCurrent`); the old per-drag `dragSel` scratch object
+          // is gone with the native-range hack it served.
           // v1.15.3: MD edit/read toggle. null = automatic (the legacy
           // behavior): pending diffs show the editable review view, clean
           // files show the rendered document. Explicit true/false force the
@@ -4460,10 +4498,6 @@ window.__ModuleLoader__.load({
           const [searchTick, setSearchTick] = React.useState(0)
           const inpRef = React.useState({ el: null })[0]
           const focusSearchRef = React.useState({ n: 0 })[0]
-          // v1.22 multi-line drag selection: anchor/caret records (see the
-          // handlers near onCodeKeyDown). Kept with the other hooks — this
-          // pane has early returns, and hooks must stay unconditional.
-          const dragSel = React.useState({ active: false, sx: 0, sy: 0, node: null, off: 0, row: -1, moved: false })[0]
           const bumpSearch = () => setSearchTick((n) => n + 1)
           // v1.24: register this pane's "close the search box" action so the
           // document-level ESC handler can close it while focus is anywhere
@@ -4571,6 +4605,47 @@ window.__ModuleLoader__.load({
           const scopeState = React.useState({ key: '', flashTimer: null, caretTimer: null })[0]
           const scopeGate = React.useState({ pending: false })[0]
           const outlineRef = React.useState({ list: [] })[0]
+          // v1.32.0 selection engine state. It MUST be allocated here, with
+          // the other refs: this component has early returns further down
+          // (deleted file / binary / oversized payloads), and a hook declared
+          // after one of them would make the hook count differ between
+          // renders — React then throws "Rendered fewer hooks than expected"
+          // and unmounts the whole pane. The engine's functions live far
+          // below (see selCtl); they only close over these objects.
+          const selState = React.useState({ a: null, f: null, same: true, active: false, dragging: false })[0]
+          const selLayerRef = React.useState({ node: null, scroll: null })[0]
+          const selWasRef = React.useState({ v: -1 })[0]
+          const selRafRef = React.useState({ h: 0 })[0]
+          // v1.32.1: a paint that disagrees with the settled layout is retried
+          // once (see scheduleDraw). The flag is a ref, not state: it must not
+          // re-render, and it must be readable from the rAF callback.
+          const selRedrawRef = React.useState({ retried: false })[0]
+          // v1.32.0: drop a standing selection when the model revision moves
+          // for a reason other than the selection's own replacement write
+          // (undo/redo, Enter, an agent payload landing, accept/reject). A file
+          // switch re-runs this effect against the new model. Typing is NOT a
+          // structural change, so a live drag is never disturbed by it.
+          // These two effects belong HERE, with the other hooks, rather than
+          // next to the engine they reason about: everything below `if (!diff)`
+          // sits past an early return, and a hook there makes the hook count
+          // differ between the loading render and the payload render — React
+          // then unmounts the whole pane (the blank 文件 view). Their callbacks
+          // only run after a render, so referencing clearSel/selCtl (declared
+          // further down) is safe, not a TDZ error.
+          React.useEffect(() => {
+            if (!m) return
+            if (selWasRef.v === m.version) return
+            if (selState.dragging) return
+            if (selState.a && selState.f && !selState.same) clearSel()
+          }, [m, modelVersion])
+          // A drag whose mouseup lands outside the window never reaches the
+          // pane's own handler — the release still has to end the gesture, or
+          // the editor would keep extending the selection on the next hover.
+          React.useEffect(() => {
+            const onBlur = () => { if (selState.dragging) selCtl.finish(null) }
+            window.addEventListener('blur', onBlur)
+            return () => window.removeEventListener('blur', onBlur)
+          }, [])
           const outline = React.useMemo(() => {
             if (diff && diff.note === 'large' && Array.isArray(diff.preview)) return buildOutline(diff.preview, lang)
             if (!m || !Array.isArray(m.lines)) return []
@@ -5158,27 +5233,33 @@ window.__ModuleLoader__.load({
             const mod = ev.ctrlKey || ev.metaKey
             const key = (ev.key || '').toLowerCase()
             const stop = () => { ev.preventDefault(); ev.stopPropagation() }
+            // v1.32.0: with a standing selection the capture handler has
+            // already consumed everything it owns (typing, delete, copy/cut,
+            // Shift+arrows, Esc, Ctrl+A). What is left reaches the editor
+            // handlers as a collapsed caret — but the DOM selection is gone,
+            // so caretModelPos would read a stale/foreign range: use the
+            // selection's focus position instead.
             if (mod && key === 'z') { stop(); if (ev.shiftKey) redoModel(mm); else undoModel(mm); return }
             if (mod && key === 'y') { stop(); redoModel(mm); return }
             if (mod && key === 's') { stop(); void saveCurrent(); return }
             if (key === 'tab') { stop(); if (ev.shiftKey) outdentModel(mm); else indentModel(mm); return }
             if (key === 'enter') { stop(); newlineModel(mm); return }
             if (key === 'backspace') {
-              const info = caretModelPos(mm)
+              const info = modelCaret(mm)
               if (info && info.pos === 0 && info.row > 0) { stop(); mergeBackwardModel(mm); return }
             }
             if (key === 'delete') {
-              const info = caretModelPos(mm)
+              const info = modelCaret(mm)
               if (info && info.row >= 0 && info.row < mm.lines.length - 1 && info.pos >= mm.lines[info.row].length) {
                 stop(); mergeForwardModel(mm); return
               }
             }
             if (key === 'arrowup') {
-              const info = caretModelPos(mm)
+              const info = modelCaret(mm)
               if (info && info.pos === 0 && info.row > 0) { stop(); moveCaretRow(mm, info.row - 1, mm.lastCol); return }
             }
             if (key === 'arrowdown') {
-              const info = caretModelPos(mm)
+              const info = modelCaret(mm)
               if (info && info.row >= 0 && info.row < mm.lines.length - 1 && info.pos >= mm.lines[info.row].length) {
                 stop(); moveCaretRow(mm, info.row + 1, Math.max(mm.lastCol, info.pos)); return
               }
@@ -5220,6 +5301,17 @@ window.__ModuleLoader__.load({
             if (!ed) return
             ev.preventDefault()
             ev.stopPropagation()
+            // v1.32.0: pasting over a standing selection replaces it.
+            if (selCtl.active()) {
+              let pt = ''
+              try {
+                const cd0 = ev.clipboardData
+                if (cd0) pt = cd0.getData('text/plain') || ''
+              } catch (e3) {}
+              pt = pt.replace(/\r\n/g, '\n').replace(/\r/g, '')
+              replaceSelModel(mm, pt)
+              return
+            }
             const info = caretModelPos(mm)
             if (!info) return
             let text = ''
@@ -5242,63 +5334,714 @@ window.__ModuleLoader__.load({
               mm.pendingCaret = { line: lastRow, pos: lastPos }
             }
           }
-          // v1.22 multi-line mouse selection: Chromium clamps a drag to the
-          // editing host a drag starts in, so dragging from one per-line
-          // contentEditable to another never extended the selection. As soon
-          // as the drag leaves the anchor row, take over with a real DOM
-          // range built from caretRangeFromPoint endpoints (works across the
-          // transparent per-line spans; the row text and highlights stay
-          // intact). In-row drags keep the native gesture untouched.
-          const caretAtPoint = (x, y) => {
-            try {
-              if (typeof document.caretRangeFromPoint !== 'function') return null
-              const r = document.caretRangeFromPoint(x, y)
-              if (!r) return null
-              return { node: r.startContainer, off: r.startOffset }
-            } catch (e) { return null }
-          }
-          const rowKeyOfNode = (node) => {
-            let el = node
-            if (el && el.nodeType !== 1) el = el.parentElement
-            if (!el || !el.getAttribute || el.getAttribute('data-m') === null) return null
-            const v = Number(el.getAttribute('data-m'))
-            return Number.isInteger(v) ? v : null
-          }
-          const extendDragSelection = (ev) => {
-            if (!dragSel.active || !dragSel.moved) return
-            // Only engage when the anchor sits on a code row (not buttons,
-            // the line-number gutter or the hunk head).
-            if (dragSel.row === null || dragSel.row < 0) return
-            const cur = caretAtPoint(ev.clientX, ev.clientY)
-            if (!cur) return
-            const curRow = rowKeyOfNode(cur.node)
-            if (curRow === null || curRow === dragSel.row) return
-            // The drag crossed into another row — build the full range.
-            let start = dragSel.node && dragSel.off !== undefined ? { node: dragSel.node, off: dragSel.off } : null
-            if (!start) { const s0 = caretAtPoint(dragSel.sx, dragSel.sy); if (s0) start = s0 }
-            if (!start) return
-            let sel = null
-            try { sel = window.getSelection && window.getSelection() } catch (e) { return }
-            if (!sel) return
-            let aNode = start.node, aOff = start.off
-            let bNode = cur.node, bOff = cur.off
-            // swap so start <= end in document order
-            let swap = false
-            try {
-              const cmp = aNode.compareDocumentPosition(bNode)
-              if (cmp === 0) { if (aOff > bOff) swap = true }
-              else if (cmp & Node.DOCUMENT_POSITION_FOLLOWING) swap = true
-            } catch (e) {
-              if (curRow < dragSel.row) swap = true
+          // ---------- v1.32.0: editor-grade selection ----------
+          // Each code row is its own per-line contentEditable, and the browser
+          // CLAMPS a drag gesture to the editing host it started in: a range
+          // built by hand across two such hosts is replaced by the native
+          // in-row selection on the very next mousemove. Cross-line selection
+          // therefore cannot be delegated to the browser — the editor claims
+          // the whole gesture instead:
+          //
+          //   mousedown  → no native selection at all (preventDefault); the
+          //                press point becomes a model coordinate {row, pos}
+          //   mousemove  → the drag endpoint is re-resolved from the pointer
+          //                and a tint per line fragment is painted by `draw`
+          //   mouseup    → a click (never moved) drops the caret exactly like
+          //                before; a real drag keeps the selection standing
+          //   keys       → Ctrl+C/X read the range off the MODEL, typing,
+          //                Backspace/Delete, Enter, Tab and paste REPLACE it,
+          //                Shift+arrows expand it, Ctrl+A selects the file
+          //
+          // The model (not the DOM) is the source of truth for offsets: one
+          // line may be up to three DOM copies (editable layer, highlight
+          // layer, selection spans), so every offset is resolved through the
+          // row's text span and clamped to the model line's length.
+          // The engine's state lives with the other pane refs, far above —
+          // see the selState block next to outlineRef.
+
+          // v1.32.1: `plan` holds BLOCKS, not rows — the entries are
+          // { kind: 'ctx', rows } and { kind: 'hunk', h, oldRows, newRows }, so
+          // a test for 'model'/'ro' never matched and this map stayed empty.
+          // Every press then failed its lookup in pointAt and the whole
+          // selection gesture was dead (no tint, no caret on click). Walk the
+          // block shape instead, keying each row exactly as the DOM does:
+          // 'm'+model for editable rows, 'o'+hunkId+':'+n for deleted ones.
+          // Deleted rows get a `model` too: the ordinal of the model line they
+          // occupy visually (a hunk of M new lines shows N old ones in the same
+          // M slots), so row ordinals stay a single coordinate space.
+          const rowsByKeyNow = () => {
+            const map = new Map()
+            for (const b of plan) {
+              if (b.kind === 'ctx') {
+                for (const r of b.rows) map.set('m' + r.model, r)
+              } else {
+                for (const r of b.oldRows) {
+                  const slot = Math.min(b.h.newStart + (r.n - b.h.oldStart - 1), b.h.newStart + Math.max(0, b.h.newLen - 1))
+                  map.set('o' + b.h.id + ':' + r.n, { n: r.n, text: r.text, model: Math.max(0, slot), ro: true })
+                }
+                for (const r of b.newRows) map.set('m' + r.model, r)
+              }
             }
-            if (swap) { const tn = aNode, to = aOff; aNode = bNode; aOff = bOff; bNode = tn; bOff = to }
+            return map
+          }
+          // row → { key, rec, el } for the two row kinds that can be selected
+          // (editable model rows and read-only deleted rows). `el` is null
+          // while React has not committed the row.
+          // v1.32.1: like rowsByKeyNow, this walked `blocks` — the RANGE
+          // descriptors, which carry no row list at all — so `b.rows` was
+          // undefined, paint() threw "b.rows is not iterable" and no tint was
+          // ever drawn. Walk the plan's block shape instead.
+          const byModel = () => {
+            const map = new Map()
+            for (const b of plan) {
+              if (b.kind === 'ctx') {
+                for (const r of b.rows) map.set(r.model, { key: 'm' + r.model, rec: r, el: m ? m.rowEls.get(r.model) : null })
+              } else {
+                for (const r of b.newRows) map.set(r.model, { key: 'm' + r.model, rec: r, el: m ? m.rowEls.get(r.model) : null })
+              }
+            }
+            return map
+          }
+          // Character offset of a pointer x inside one row's text span.
+          // Measured per GLYPH with a live Range so token spans, tabs, CJK
+          // and wide glyphs all land on the real nearest boundary; the right
+          // half of a glyph rounds to the next boundary. Returns null when
+          // the span has no box yet (row never rendered) and the caller falls
+          // back to treating the point as end-of-line.
+          const offsetAtX = (span, clientX) => {
+            if (!span) return null
+            const text = span.firstChild
+            if (!text || text.nodeType !== 3) return 0
+            const len = text.length
+            if (len === 0) return 0
+            const rng = document.createRange()
+            const p1 = span.getBoundingClientRect()
+            const wide = document.createRange()
+            wide.selectNodeContents(span)
+            const p2 = wide.getBoundingClientRect()
+            if (p1.width <= 0 && p2.width <= 0) return null
+            const left = p1.width > 0 ? p1.left : p2.left
+            if (clientX <= left) return 0
+            const right = p2.width > 0 ? p2.right : p1.right
+            if (clientX >= right) return len
+            // Rightmost glyph whose LEFT edge is at or left of the pointer
+            // (box i = [i, i+1), which has a real width even for the last
+            // glyph). Then the boundary is picked by that glyph's midpoint:
+            // left half → before it, right half → after it. Probing with
+            // single-glyph ranges keeps the search truthful regardless of
+            // kerning or wide glyphs.
+            let lo = 0
+            let hi = len - 1
+            while (lo < hi) {
+              const mid = (lo + hi + 1) >> 1
+              rng.setStart(text, mid)
+              rng.setEnd(text, mid + 1)
+              if (rng.getBoundingClientRect().left <= clientX) lo = mid
+              else hi = mid - 1
+            }
+            rng.setStart(text, lo)
+            rng.setEnd(text, lo + 1)
+            const cr = rng.getBoundingClientRect()
+            if (cr.width <= 1e-6) return clientX <= cr.left ? lo : lo + 1
+            return clientX < cr.left + cr.width / 2 ? lo : lo + 1
+          }
+          // Resolve a viewport point to a {key, pos} target once: the row is
+          // found by geometry (elementFromPoint, then a nearest-row scan for
+          // slices that hit no row box at all — the gutter gap above the
+          // first row, the empty strip right of a short line), the offset by
+          // the row's text span and the pointer x.
+          const pointAt = (clientX, clientY) => {
+            const scroller = diffRef.node
+            if (!scroller) return null
+            const sr = scroller.getBoundingClientRect()
+            let rowEl = null
             try {
-              const range = document.createRange()
-              range.setStart(aNode, aOff)
-              range.setEnd(bNode, bOff)
-              sel.removeAllRanges()
-              sel.addRange(range)
+              const hit = document.elementFromPoint(clientX, clientY)
+              if (hit && scroller.contains(hit) && hit.closest) rowEl = hit.closest('.dsh-fe-line')
             } catch (e) {}
+            let bestD = Infinity
+            let bestC = null
+            for (const cand of scroller.querySelectorAll('.dsh-fe-line')) {
+              const r = cand.getBoundingClientRect()
+              if (r.height <= 0) continue
+              const d = clientY < r.top ? r.top - clientY : (clientY > r.bottom ? clientY - r.bottom : 0)
+              if (d < bestD) { bestD = d; bestC = cand }
+              if (d === 0 && rowEl) break
+            }
+            if (!rowEl) rowEl = bestC
+            if (!rowEl) return null
+            // Row identity: the editable layer carries the model index; the
+            // read-only deleted rows carry their own key (data-rk). The
+            // data-n gutter number is only a fallback (hunk rows number the
+            // NEW file, so it cannot identify a context row reliably).
+            const ed = rowEl.querySelector('.dsh-fe-tx-edit')
+            const rk = rowEl.getAttribute('data-rk')
+            const key = rk || (ed ? 'm' + ed.getAttribute('data-m') : (rowEl.getAttribute('data-n') ? 'm' + (Number(rowEl.getAttribute('data-n')) - 1) : null))
+            if (!key) return null
+            const rec = rowsByKeyNow().get(key)
+            if (!rec) return null
+            // The row ordinal the engine reasons in is the MODEL line index.
+            // Editable rows carry it; the deleted ones were given theirs when
+            // the map was built (see rowsByKeyNow).
+            const row = rec.model
+            if (row === null || row === undefined) return null
+            const span = rowEl.querySelector('.dsh-fe-txwrap .dsh-fe-tx')
+            const raw = offsetAtX(span, clientX)
+            const len = String(rec.text == null ? '' : rec.text).length
+            // No box for this row yet (content-visibility keeps offscreen
+            // rows boxless until painted): treat the point as the line's end
+            // or start depending on which side of the row it fell.
+            let pos
+            if (raw === null) {
+              const rb = rowEl.getBoundingClientRect()
+              pos = clientX < rb.left + rb.width / 2 ? 0 : len
+            } else {
+              pos = raw
+            }
+            return { key: key, row: row, pos: Math.max(0, Math.min(len, pos)) }
+          }
+          const ensureLayer = () => {
+            const scroller = diffRef.node
+            if (!scroller) return null
+            let layer = selLayerRef.node
+            if (layer && layer.isConnected && layer.parentNode === scroller) return layer
+            layer = document.createElement('div')
+            layer.className = 'dsh-fe-sel'
+            selLayerRef.node = layer
+            scroller.insertBefore(layer, scroller.firstChild)
+            if (selLayerRef.scroll) { try { selLayerRef.scroll() } catch (e) {} }
+            selLayerRef.scroll = () => drawSel()
+            scroller.addEventListener('scroll', selLayerRef.scroll)
+            return layer
+          }
+          const dropLayer = () => {
+            const layer = selLayerRef.node
+            const scroller = layer && layer.parentNode
+            if (scroller && selLayerRef.scroll) scroller.removeEventListener('scroll', selLayerRef.scroll)
+            selLayerRef.scroll = null
+            if (layer && layer.remove) layer.remove()
+            selLayerRef.node = null
+          }
+          const clearSelDom = () => {
+            const layer = selLayerRef.node
+            if (layer) layer.textContent = ''
+          }
+          // One tint per selected line fragment, measured against the rows'
+          // own boxes. Rects are placed in the layer's VIEWPORT coordinate
+          // space (the scrollport's padding box), so they automatically track
+          // the text while scrolling and need no scroll offset at all; the
+          // freshly painted head is dropped and redrawn on the next paint.
+          // Every paint re-measures from the live DOM, so a re-render that
+          // replaces row elements never leaves stale rects behind.
+          //
+          // The x of a range boundary inside one row is measured the same way
+          // `offsetAtX` measures it (a live Range around the partial text),
+          // so the tint starts and ends exactly where the caret would sit.
+          // Fragment boxes span the row's full line box, which is what makes
+          // the selection read like a plain-text editor instead of like a
+          // text-node selection.
+          const xAtPos = (span, pos) => {
+            if (!span) return null
+            const text = span.firstChild
+            if (!text || text.nodeType !== 3) return null
+            const len = text.length
+            const p = Math.max(0, Math.min(len, pos))
+            const rng = document.createRange()
+            rng.setStart(text, p)
+            rng.setEnd(text, p)
+            let r = rng.getBoundingClientRect()
+            if (r.width <= 0 && r.height <= 0 && p > 0) {
+              // Fully collapsed rects are unreliable in some engines — fall
+              // back to the END of the preceding glyph.
+              rng.setStart(text, p - 1)
+              rng.setEnd(text, p)
+              r = rng.getBoundingClientRect()
+              return r.right
+            }
+            return r.left
+          }
+          const paint = (s) => {
+            const layer = selLayerRef.node
+            const scroller = diffRef.node
+            if (!layer || !scroller) return
+            const a = s.a.row < s.f.row || (s.a.row === s.f.row && s.a.pos <= s.f.pos) ? s.a : s.f
+            const b = a === s.a ? s.f : s.a
+            const byRow = byModel()
+            const sr = scroller.getBoundingClientRect()
+            const frags = []
+            for (let r = a.row; r <= b.row; r++) {
+              const entry = byRow.get(r)
+              // rowEls holds the editable SPAN (the editing host), not the row
+              // element: measuring it directly gave a 117px-wide box instead of
+              // the full line, and reading its children threw. Climb to the
+              // .dsh-fe-line and use the row's own box, exactly as
+              // pointAt does.
+              const rowEl = entry && entry.el && entry.el.closest ? entry.el.closest('.dsh-fe-line') : null
+              if (!rowEl || !rowEl.getBoundingClientRect) continue
+              const box = rowEl.getBoundingClientRect()
+              if (box.height <= 0) continue
+              const span = rowEl.querySelector('.dsh-fe-txwrap .dsh-fe-tx')
+              const sbox = span && span.getBoundingClientRect ? span.getBoundingClientRect() : null
+              // Whole-row fragments run from the first glyph to the last one
+              // (a line-wise selection stops at the text, not at the pane
+              // edge); the fragment where the drag STARTED begins at the
+              // anchor glyph and the one it ENDS in stops at the focus glyph.
+              let x1 = sbox && sbox.width > 0 ? sbox.left : box.left + 3
+              let x2 = sbox && sbox.width > 0 ? sbox.right : box.right - 6
+              if (span) {
+                if (r === a.row) {
+                  const xa = xAtPos(span, a.pos)
+                  if (typeof xa === 'number') x1 = xa
+                }
+                if (r === b.row) {
+                  const xb = xAtPos(span, b.pos)
+                  if (typeof xb === 'number') x2 = xb
+                }
+              }
+              if (x2 < x1) x2 = x1
+              frags.push({ x1: x1, x2: x2, top: box.top, bottom: box.bottom })
+            }
+            clearSelDom()
+            if (frags.length === 0) return
+            const frag = document.createDocumentFragment()
+            for (const g of frags) {
+              const el = document.createElement('div')
+              el.className = 'dsh-fe-sel-seg'
+              el.style.left = (g.x1 - sr.left) + 'px'
+              el.style.top = (g.top - sr.top) + 'px'
+              el.style.width = Math.max(2, g.x2 - g.x1) + 'px'
+              el.style.height = Math.max(1, g.bottom - g.top) + 'px'
+              frag.appendChild(el)
+            }
+            layer.appendChild(frag)
+          }
+          const drawSel = () => {
+            const s = selState
+            if (!s.a || !s.f || s.same) {
+              dropLayer()
+              return
+            }
+            ensureLayer()
+            paint(s)
+          }
+          // v1.32.1: never trust the frame the gesture handed us. Drawing from a
+          // mousemove means measuring rows while React may still be committing
+          // them, and the fragments then come out in a coordinate space that no
+          // longer matches the scrollport (measured live: fragments written for
+          // a scrollport at top 0 while the settled one sat at top 171). Rather
+          // than guess a frame count, verify the paint against the live layout
+          // and redraw once if it disagrees.
+          const paintMatchesLayout = (s) => {
+            const scroller = diffRef.node
+            const layer = selLayerRef.node
+            if (!scroller || !layer || !s.a || !s.f || s.same) return true
+            const far = Math.max(s.a.row, s.f.row)
+            const entry = byModel().get(far)
+            const rowEl = entry && entry.el && entry.el.closest ? entry.el.closest('.dsh-fe-line') : null
+            if (!rowEl) return true
+            const box = rowEl.getBoundingClientRect()
+            if (box.height <= 0) return true
+            const sr = scroller.getBoundingClientRect()
+            const want = box.top - sr.top
+            const segs = layer.querySelectorAll('.dsh-fe-sel-seg')
+            if (segs.length === 0) return false
+            let bestD = Infinity
+            for (const seg of segs) {
+              const t = parseFloat(seg.style.top)
+              if (isFinite(t)) bestD = Math.min(bestD, Math.abs(t - want))
+            }
+            // A row is ~19px tall; anything beyond a line means the paint belongs
+            // to a different layout, not merely to a rounding difference.
+            return bestD <= 24
+          }
+          const scheduleDraw = () => {
+            if (selRafRef.h) return
+            const raf = typeof requestAnimationFrame === 'function' ? requestAnimationFrame : null
+            const run = () => {
+              const settle = () => {
+                selRafRef.h = 0
+                drawSel()
+                // Re-verify against the layout that actually committed. One
+                // retry only: a second disagreement means the rows are still
+                // moving, and a later scroll/render redraws anyway.
+                if (!selRedrawRef.retried) {
+                  selRedrawRef.retried = true
+                  if (!paintMatchesLayout(selState)) scheduleDraw()
+                } else {
+                  selRedrawRef.retried = false
+                }
+              }
+              if (raf) selRafRef.h = raf(settle)
+              else selRafRef.h = setTimeout(settle, 16)
+            }
+            selRafRef.h = raf ? raf(run) : setTimeout(run, 16)
+          }
+          const setSel = (mdl, p1, p2) => {
+            selState.a = p1
+            selState.f = p2
+            selState.same = p1.row === p2.row && p1.pos === p2.pos
+            // A selection is only meaningful for the revision it was made on.
+            selWasRef.v = mdl ? mdl.version : -1
+            scheduleDraw()
+          }
+          const clearSel = () => {
+            selState.a = null
+            selState.f = null
+            selState.same = true
+            selState.dragging = false
+            dropLayer()
+          }
+          // Ordered selection in model terms (start/focus), with keys.
+          const selRange = () => {
+            const s = selState
+            if (!s.a || !s.f || s.same) return null
+            const a = s.a
+            const f = s.f
+            return a.row < f.row || (a.row === f.row && a.pos <= f.pos)
+              ? { start: { row: a.row, pos: a.pos }, end: { row: f.row, pos: f.pos }, a: a, f: f }
+              : { start: { row: f.row, pos: f.pos }, end: { row: a.row, pos: a.pos }, a: a, f: f }
+          }
+          // The model-side text of the selection (rows joined with '\n').
+          const selText = () => {
+            const r = selRange()
+            const mm = modelRef.m
+            if (!r || !mm) return ''
+            let text = ''
+            for (let row = r.start.row; row <= r.end.row && row < mm.lines.length; row++) {
+              if (row > r.start.row) text += '\n'
+              const from = row === r.start.row ? r.start.pos : 0
+              const to = row === r.end.row ? r.end.pos : mm.lines[row].length
+              text += mm.lines[row].slice(from, to)
+            }
+            return text
+          }
+          const writeClipboard = (text) => {
+            try {
+              if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).catch(() => {})
+              else {
+                const ta = document.createElement('textarea')
+                ta.value = text
+                ta.style.position = 'fixed'
+                ta.style.opacity = '0'
+                document.body.appendChild(ta)
+                ta.select()
+                try { document.execCommand('copy') } catch (e) {}
+                ta.remove()
+              }
+            } catch (e) {}
+          }
+          // Is the pressed node part of a code row (text, gutter number,
+          // highlight layer)? Used only to decide whether a press that could
+          // not be resolved to a model position (a row that has no box yet)
+          // should keep a standing selection.
+          const isRowTarget = (target) => {
+            try { return !!(target && target.closest && target.closest('.dsh-fe-line')) } catch (e) { return false }
+          }
+          const modelCaret = (mm) => {
+            if (selState.a && selState.f) {
+              const c = selState.f
+              return { row: Math.max(0, Math.min(mm.lines.length - 1, c.row)), pos: c.pos }
+            }
+            return caretModelPos(mm)
+          }
+          // Drop the caret at a model position. Deleted (read-only) rows carry
+          // no editable element, so the request snaps to the nearest editable
+          // row — up first, then down — and clamps the column to that line.
+          // Used by click resolution, selection collapse and the
+          // Shift+arrow expander.
+          const setModelCaret = (p) => {
+            const mm = modelRef.m
+            if (!mm || !p) return
+            const last = mm.lines.length - 1
+            let row = Math.max(0, Math.min(last, p.row))
+            if (!mm.rowEls.get(row)) {
+              let up = row - 1
+              let down = row + 1
+              let found = -1
+              while (found < 0 && (up >= 0 || down <= last)) {
+                if (up >= 0) { if (mm.rowEls.get(up)) { found = up; break } up-- }
+                if (down <= last) { if (mm.rowEls.get(down)) { found = down; break } down++ }
+              }
+              if (found < 0) return
+              row = found
+            }
+            const el = mm.rowEls.get(row)
+            if (!el) return
+            mm.activeIdx = row
+            const pos = Math.max(0, Math.min((mm.lines[row] || '').length, p.pos))
+            try { el.focus({ preventScroll: true }) } catch (e) {}
+            setCaretEl(el, pos)
+          }
+          // Model patches that delete a selection range. The engine treats a
+          // patch's `removed` as ONE contiguous slice of the file text and
+          // re-joins the rows it spans, so a multi-line range needs its end
+          // row prepared first:
+          //   1. the end row's remainder (text after the range) is REMOVED —
+          //      deleting a prefix on its own row never touches a row index;
+          //   2. the range itself is deleted, from the start caret across every
+          //      newline to the end row's caret, which merges the start row's
+          //      head with the (now trimmed) end row;
+          //   3. that remainder is written back at the caret — which is the
+          //      head/remainder boundary of the merged row, so the text after
+          //      the selection lands exactly where a plain editor puts it.
+          // The one shape this cannot express is a range that starts at its
+          // row's very beginning AND ends at column 0 of an EMPTY later row:
+          // joining those leaves the emptied end row behind as one blank line
+          // (the engine's own Backspace-at-column-0 merge does the same, so the
+          // editor stays self-consistent). Every other shape — including a
+          // range that reaches the end of the file — comes out exactly as a
+          // plain text editor would leave it.
+          // Everything rides a single undo entry, and no index can go stale:
+          // only step 1 touches the end row, and it only shortens it.
+          const selDeletePatches = (mm, s, e) => {
+            const patches = []
+            const line = (i) => (i >= 0 && i < mm.lines.length ? mm.lines[i] : '')
+            if (s.row === e.row) {
+              if (e.pos > s.pos) patches.push({ line: s.row, start: s.pos, removed: line(s.row).slice(s.pos, e.pos), inserted: '' })
+              return patches
+            }
+            const endLine = line(e.row)
+            const after = endLine.slice(e.pos)
+            if (after.length > 0) patches.push({ line: e.row, start: e.pos, removed: after, inserted: '' })
+            // Cross every newline up to (and including) the end row's own
+            // remaining text; the rows this spans are spliced out.
+            let spanned = line(s.row).slice(s.pos)
+            for (let r = s.row + 1; r <= e.row; r++) {
+              spanned += '\n' + (r === e.row ? endLine.slice(0, e.pos) : line(r))
+            }
+            // Selecting from the very start of a line leaves the joined row
+            // empty; when the line AFTER the range has text, take that text
+            // too and put it back at the caret, which splices the emptied row
+            // away instead of leaving a blank line behind (the same result
+            // Delete-at-line-end has in every editor). An empty following line
+            // cannot express this, and there the blank line stays.
+            let carry = ''
+            if (s.pos === 0 && after.length === 0 && e.row < mm.lines.length - 1) {
+              const nxt = line(e.row + 1)
+              if (nxt.length > 0) {
+                carry = nxt
+                spanned += '\n' + nxt
+              }
+            }
+            if (spanned.length > 0) patches.push({ line: s.row, start: s.pos, removed: spanned, inserted: '' })
+            if (after.length > 0) patches.push({ line: s.row, start: s.pos, removed: '', inserted: after })
+            if (carry.length > 0) patches.push({ line: s.row, start: s.pos, removed: '', inserted: carry })
+            return patches
+          }
+          // Typing / paste / Backspace over a standing selection: flush the
+          // line being typed, replace the whole range in one undoable entry,
+          // then let the pendingCaret effect re-anchor the engine on the
+          // caret it lands on (rowEls is stale until React commits).
+          const replaceSelModel = (mm, insert) => {
+            const r = selRange()
+            if (!r) return false
+            flushActive(mm)
+            let base = selDeletePatches(mm, r.start, r.end)
+            if (insert) base = base.concat([{ line: r.start.row, start: r.start.pos, removed: '', inserted: insert }])
+            if (base.length === 0) { clearSel(); return true }
+            const nl = insert ? insert.lastIndexOf('\n') : -1
+            const rowsAdded = nl < 0 ? 0 : insert.split('\n').length - 1
+            const caretRow = r.start.row + rowsAdded
+            const caretPos = nl < 0 ? r.start.pos + insert.length : insert.length - nl - 1
+            clearSel()
+            mm.activeIdx = null
+            pushEntry(mm, base, caretRow, caretPos)
+            mm.pendingCaret = { line: caretRow, pos: caretPos }
+            // The write is this selection's own doing: mark it as belonging
+            // to the revision it just created so the model-version guard
+            // below leaves it alone.
+            selWasRef.v = mm.version
+            return true
+          }
+          const selectAll = () => {
+            const mm = modelRef.m
+            if (!mm || mm.lines.length === 0) return
+            const a = byModel().get(0)
+            const b = byModel().get(mm.lines.length - 1)
+            if (!a || !b) return
+            setSel(mm, { key: a.key, row: 0, pos: 0 }, { key: b.key, row: mm.lines.length - 1, pos: mm.lines[mm.lines.length - 1].length })
+          }
+          const wordAt = (mm, row, pos) => {
+            const line = mm.lines[row] || ''
+            const isW = (ch) => /[A-Za-z0-9_$\u00c0-\uffff]/.test(ch)
+            if (line.length === 0) return { s: 0, e: 0 }
+            let i = Math.max(0, Math.min(line.length, pos))
+            if (i >= line.length || !isW(line[i])) {
+              if (i > 0 && isW(line[i - 1])) i -= 1
+              else return { s: i, e: i }
+            }
+            let s = i
+            let e = i
+            while (s > 0 && isW(line[s - 1])) s--
+            while (e < line.length && isW(line[e])) e++
+            return { s: s, e: e }
+          }
+          const shiftExpand = (dir, word) => {
+            const mm = modelRef.m
+            if (!mm) return
+            let a = selState.a
+            let f = selState.f
+            if (!a || !f) {
+              const c = caretModelPos(mm) || { row: 0, pos: 0 }
+              const rec = byModel().get(c.row)
+              a = { key: rec ? rec.key : null, row: c.row, pos: c.pos }
+              f = a
+            }
+            let target = null
+            if (dir === 'left' || dir === 'right') {
+              const line = mm.lines[f.row] || ''
+              if (word) {
+                if (dir === 'left') {
+                  let i = f.pos
+                  while (i > 0 && !/[A-Za-z0-9_$\u00c0-\uffff]/.test(line[i - 1])) i--
+                  while (i > 0 && /[A-Za-z0-9_$\u00c0-\uffff]/.test(line[i - 1])) i--
+                  target = { row: f.row, pos: i }
+                } else {
+                  let i = f.pos
+                  while (i < line.length && !/[A-Za-z0-9_$\u00c0-\uffff]/.test(line[i])) i++
+                  while (i < line.length && /[A-Za-z0-9_$\u00c0-\uffff]/.test(line[i])) i++
+                  target = { row: f.row, pos: i }
+                }
+              } else if (dir === 'left') {
+                target = f.pos > 0 ? { row: f.row, pos: f.pos - 1 } : (f.row > 0 ? { row: f.row - 1, pos: (mm.lines[f.row - 1] || '').length } : { row: f.row, pos: 0 })
+              } else {
+                target = f.pos < line.length ? { row: f.row, pos: f.pos + 1 } : (f.row < mm.lines.length - 1 ? { row: f.row + 1, pos: 0 } : { row: f.row, pos: line.length })
+              }
+            } else {
+              const up = dir === 'up'
+              const row = up ? f.row - 1 : f.row + 1
+              if (row < 0 || row >= mm.lines.length) return
+              const col = mm.lastCol || f.pos
+              target = { row: row, pos: Math.min(col, (mm.lines[row] || '').length) }
+            }
+            if (!target) return
+            const rec = byModel().get(target.row)
+            setSel(mm, a, { key: rec ? rec.key : null, row: target.row, pos: target.pos })
+            mm.lastCol = f.pos
+          }
+          const selCtl = {
+            st: selState,
+            begin: (p, shift) => {
+              const mm = modelRef.m
+              selState.dragging = false
+              if (!mm) return
+              selWasRef.v = mm.version
+              if (shift && selState.a) {
+                // Shift+click: the standing anchor is the pivot.
+                selState.f = p
+                selState.same = selState.a.row === p.row && selState.a.pos === p.pos
+                scheduleDraw()
+                selState.dragging = true
+                return
+              }
+              selState.a = p
+              selState.f = { key: p.key, row: p.row, pos: p.pos }
+              selState.same = true
+              selState.dragging = true
+              dropLayer()
+            },
+            detail: (p, n) => {
+              const mm = modelRef.m
+              if (!mm || !p) return false
+              if (n >= 3) {
+                const rec = byModel().get(p.row)
+                setSel(mm, { key: rec ? rec.key : p.key, row: p.row, pos: 0 }, { key: rec ? rec.key : p.key, row: p.row, pos: (mm.lines[p.row] || '').length })
+                selState.dragging = false
+                return true
+              }
+              if (n === 2) {
+                const r = wordAt(mm, p.row, p.pos)
+                const rec = byModel().get(p.row)
+                const key = rec ? rec.key : p.key
+                setSel(mm, { key: key, row: p.row, pos: r.s }, { key: key, row: p.row, pos: r.e })
+                selState.dragging = false
+                return true
+              }
+              return false
+            },
+            move: (p) => {
+              if (!selState.dragging || !selState.a) return
+              selState.f = p
+              selState.same = selState.a.row === p.row && selState.a.pos === p.pos
+              scheduleDraw()
+            },
+            finish: (p) => {
+              if (!selState.dragging) return
+              selState.dragging = false
+              const mm = modelRef.m
+              const drop = p || selState.f
+              if (!mm || !drop) return
+              if (selState.same) {
+                clearSel()
+                setModelCaret(drop)
+              }
+            },
+            clear: clearSel,
+            caret: modelCaret,
+            range: selRange,
+            text: selText,
+            replace: replaceSelModel,
+            all: selectAll,
+            draw: drawSel,
+            expand: shiftExpand,
+            active: () => !!(selState.a && selState.f && !selState.same),
+          }
+          // v1.32.0 selection keys. Capture phase, so an active selection is
+          // handled BEFORE the row's own keydown (revert-this-line on ESC)
+          // and before the container's editing keys. Returns nothing: it only
+          // stops the event when it acted on it.
+          const onCodeKeyDownCapture = (ev) => {
+            const mod = ev.ctrlKey || ev.metaKey
+            const key = (ev.key || '').toLowerCase()
+            const stop = () => { ev.preventDefault(); ev.stopPropagation() }
+            const mm = modelRef.m
+            // Esc always drops a standing selection first.
+            if (key === 'escape' && selCtl.active()) { stop(); clearSel(); return }
+            if (!mm) return
+            if (mod && key === 'a') {
+              // Select the whole editable file (deleted/read-only rows are
+              // not part of the model, so they are never included).
+              stop()
+              selectAll()
+              return
+            }
+            if (!selCtl.active()) return
+            if (mod && key === 'c') { stop(); writeClipboard(selText()); return }
+            if (mod && key === 'x') {
+              stop()
+              writeClipboard(selText())
+              replaceSelModel(mm, '')
+              return
+            }
+            if (key === 'backspace' || key === 'delete') { stop(); replaceSelModel(mm, ''); return }
+            if (key === 'tab') { stop(); if (ev.shiftKey) outdentModel(mm); else indentModel(mm); return }
+            if (ev.shiftKey && (key === 'arrowleft' || key === 'arrowright' || key === 'arrowup' || key === 'arrowdown')) {
+              stop()
+              const dir = key === 'arrowleft' ? 'left' : key === 'arrowright' ? 'right' : key === 'arrowup' ? 'up' : 'down'
+              shiftExpand(dir, mod)
+              return
+            }
+            if (key === 'arrowleft' || key === 'arrowright' || key === 'arrowup' || key === 'arrowdown'
+              || key === 'home' || key === 'end' || key === 'pageup' || key === 'pagedown') {
+              // Any other navigation collapses to the caret first (exactly
+              // like a plain editor), then the existing handlers do the move.
+              stop()
+              const r = selRange()
+              const focus = selState.f
+              const c = r ? (key === 'arrowleft' || key === 'arrowup' || key === 'home' || key === 'pageup' ? r.start : r.end) : focus
+              clearSel()
+              // The container handlers own Enter/arrows only inside a line;
+              // for a cross-line collapse we place the caret ourselves.
+              if (c) setModelCaret(c)
+              return
+            }
+            if (ev.altKey) return
+            if (key.length === 1 && !mod) {
+              // Typing replaces the selection, like any editor.
+              stop()
+              if (replaceSelModel(mm, ev.key)) return
+            }
+            if (key === 'enter') { stop(); replaceSelModel(mm, '\n'); return }
           }
           const saveCurrent = async () => {
             const mm = modelRef.m
@@ -5326,7 +6069,7 @@ window.__ModuleLoader__.load({
           }
           const renderRoRow = (key, cls, n, text, hlState) => {
             const isOld = cls.indexOf('dsh-fe-old') >= 0
-            return React.createElement('div', { key: key, className: 'dsh-fe-line ' + cls, 'data-n': String(n) },
+            return React.createElement('div', { key: key, className: 'dsh-fe-line ' + cls, 'data-n': String(n), 'data-rk': isOld ? key : undefined },
               React.createElement('span', { className: 'dsh-fe-ln' }, String(n)),
               React.createElement('span', { className: 'dsh-fe-txwrap' },
                 React.createElement('span', {
@@ -5375,8 +6118,16 @@ window.__ModuleLoader__.load({
                 className: 'dsh-fe-txwrap',
                 onClick: (ev) => {
                   if (ev.target !== ev.currentTarget) return
+                  // Click in the empty tail of a line: land the caret at the
+                  // end of THAT line (a plain editor puts it after the last
+                  // glyph, not wherever the span happened to keep its focus).
                   const ed = ev.currentTarget.querySelector('.dsh-fe-tx-edit')
-                  if (ed && ed.focus) ed.focus()
+                  if (!ed || !ed.focus) return
+                  if (selCtl.active()) return
+                  const mm = modelRef.m
+                  const row = Number(ed.getAttribute('data-m'))
+                  if (mm && Number.isInteger(row)) setModelCaret({ row: row, pos: (mm.lines[row] || '').length })
+                  else ed.focus()
                 },
               },
                 React.createElement('span', {
@@ -5560,6 +6311,9 @@ window.__ModuleLoader__.load({
           const caretLineAt = () => {
             const sc = diffRef.node
             if (!sc || typeof window === 'undefined') return 0
+            // v1.32.0: a standing editor selection has no DOM selection of its
+            // own — its focus row IS the insertion point for 上一处/下一处.
+            if (selState.f && selState.a) return selState.f.row + 1
             let sel = null
             try { sel = window.getSelection && window.getSelection() } catch (e) {}
             if (!sel || sel.rangeCount === 0) return 0
@@ -5570,6 +6324,13 @@ window.__ModuleLoader__.load({
             if (!sc.contains(el)) return 0
             const line = el.closest('.dsh-fe-line')
             if (!line) return 0
+            // The model row is the truth: the hunk rows number the NEW file,
+            // so data-n cannot identify a context row reliably.
+            const ed = line.querySelector('.dsh-fe-tx-edit')
+            if (ed) {
+              const mm = Number(ed.getAttribute('data-m'))
+              if (Number.isInteger(mm)) return mm + 1
+            }
             const n = Number(line.getAttribute('data-n'))
             return n > 0 ? n : 0
           }
@@ -5872,31 +6633,34 @@ window.__ModuleLoader__.load({
               React.createElement('div', {
                 className: 'dsh-fe-diff',
                 ref: (node) => { diffRef.node = node },
-                onScroll: onDiffScroll,
+                onScroll: (ev) => { onDiffScroll(ev); drawSel() },
                 onKeyDown: onCodeKeyDown,
+                onKeyDownCapture: onCodeKeyDownCapture,
                 onPaste: onCodePaste,
                 onMouseDown: (ev) => {
-                  if (ev.button !== 0) { dragSel.active = false; return }
-                  dragSel.active = true
-                  dragSel.moved = false
-                  dragSel.sx = ev.clientX
-                  dragSel.sy = ev.clientY
-                  dragSel.row = (ev.target && ev.target.closest && ev.target.closest('.dsh-fe-line')) ? rowKeyOfNode(ev.target) : null
-                  dragSel.node = null
-                  dragSel.off = 0
+                  if (ev.button !== 0) return
+                  const p = pointAt(ev.clientX, ev.clientY)
+                  // v1.32.0: the editor owns the whole gesture — no native
+                  // selection (which the per-line contentEditable would clamp
+                  // to one row), no native focus juggling. The click point
+                  // becomes a model coordinate and the drag paints it.
+                  if (p) {
+                    try { ev.preventDefault() } catch (e) {}
+                    selCtl.begin(p, ev.shiftKey)
+                    if (ev.detail > 1) selCtl.detail(p, ev.detail)
+                  } else if (!isRowTarget(ev.target)) {
+                    // Pressed outside the code (hunk head, toolbar gap…):
+                    // drop a standing selection rather than leave it behind.
+                    clearSel()
+                  }
                 },
                 onMouseMove: (ev) => {
-                  if (!dragSel.active) return
-                  if ((ev.buttons & 1) !== 1) { dragSel.active = false; return }
-                  if (!dragSel.moved) {
-                    if (Math.abs(ev.clientX - dragSel.sx) + Math.abs(ev.clientY - dragSel.sy) < 4) return
-                    dragSel.moved = true
-                    const s0 = caretAtPoint(dragSel.sx, dragSel.sy)
-                    if (s0) { dragSel.node = s0.node; dragSel.off = s0.off }
-                  }
-                  extendDragSelection(ev)
+                  if (!selState.dragging) return
+                  if ((ev.buttons & 1) !== 1) { selCtl.finish(null); return }
+                  const p = pointAt(ev.clientX, ev.clientY)
+                  if (p) selCtl.move(p)
                 },
-                onMouseUp: () => { dragSel.active = false },
+                onMouseUp: (ev) => { selCtl.finish(pointAt(ev.clientX, ev.clientY)) },
               },
                 plan.map((b, i) => {
                   if (b.kind === 'ctx') {

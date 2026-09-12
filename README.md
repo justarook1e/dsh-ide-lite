@@ -19,7 +19,6 @@ DSH WebUI 的轻量 IDE 插件：把「文件」和「终端」两个标签页�
 ## 安装
 
 ```powershell
-cd C:\Users\HW\deepseek-harness
 pnpm dsh plugin --profile web add @justarook1e/dsh-ide-lite
 ```
 
