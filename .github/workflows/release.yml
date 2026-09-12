@@ -11,7 +11,7 @@ on:
 
 permissions:
   contents: read
-  id-token: write # npm provenance attestation
+  id-token: write # OIDC: trusted publishing + automatic provenance
 
 jobs:
   publish:
@@ -19,13 +19,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 11
-
+      # Node 24 ships npm >= 11.5.1, the floor for trusted publishing, and npm is
+      # the CLI that performs the OIDC exchange. The previous setup published with
+      # pnpm on Node 22 (npm 10.x) and only warned
+      # "[WARN] Skipped OIDC: ERR_PNPM_AUTH_TOKEN_EXCHANGE ... (status code 404)"
+      # before falling back to NPM_TOKEN.
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
           registry-url: 'https://registry.npmjs.org'
 
       - name: Verify the tag matches package.json
@@ -54,7 +55,10 @@ jobs:
             console.log('manifest ok:', p.name + '@' + p.version);
           "
 
+      # Trusted publishing: npm exchanges the GitHub OIDC token for a short-lived
+      # publish credential, so there is NO NPM_TOKEN to hold or rotate. Provenance
+      # is generated automatically on that path — do not pass --provenance, and do
+      # not set NODE_AUTH_TOKEN (a token would take precedence over OIDC).
+      # The workflow filename must match the trusted publisher entry on npmjs.com.
       - name: Publish to npm
-        run: pnpm publish --access public --no-git-checks --provenance
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public
