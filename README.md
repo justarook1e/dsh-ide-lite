@@ -46,7 +46,7 @@ pnpm dsh plugin --profile web remove @justarook1e/dsh-ide-lite
 
 ## 文档
 
-本 README 是唯一随 npm 包发布的文档。项目规范、踩坑记录与交接说明见仓库中的 [DEV.md](https://github.com/justarook1e/dsh-ide-lite/blob/main/DEV.md)。
+本 README 是唯一随 npm 包发布的文档；项目规范、踩坑记录与交接说明在开发者的本地工作副本中，不随仓库发布。
 
 ## 许可证
 
