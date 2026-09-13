@@ -9,3 +9,9 @@ DEV.md
 
 # Throwaway verification harnesses (node .verify/check-client.mjs)
 .verify/
+
+# Performance benchmark harness + its fixtures. The fixtures themselves live
+# outside the repo (~/.dsh/dsh-bench-fixtures) because they are ~1.5GB of review
+# state; this entry is the backstop that keeps a stray `git add .` from picking
+# up the scripts or any fixture copy that lands here.
+.bench/

@@ -3,8 +3,9 @@
 // Browser RPC arrives at POST /dsh-file-edit/api (registered on ctx.webServer).
 // Per-session review state (baseline + pending decisions) is persisted under
 // ~/.dsh/dsh-file-edit-state/<sessionId>.json so accept/reject survives restarts.
-import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, readdirSync, rmSync, statSync, createWriteStream } from 'node:fs'
-import { join, relative, isAbsolute, resolve as resolvePath } from 'node:path'
+import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, readdirSync, rmSync, statSync, createWriteStream, realpathSync, chmodSync } from 'node:fs'
+import { open as openP } from 'node:fs/promises'
+import { join, dirname, relative, isAbsolute, resolve as resolvePath } from 'node:path'
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { homedir, tmpdir } from 'node:os'
@@ -202,8 +203,124 @@ export default {
       if (t.endsWith('\n')) parts.pop()
       return parts
     }
-    function joinLines(lines, trailingNL, crlf) {
+    // v1.33 (F6): the write style must be PER LINE when a file MIXES endings.
+    // `crlf` is one boolean ("the file contains at least one CRLF"), so rebuilding
+    // a mixed file with it rewrote EVERY line's ending: a one-line inline edit
+    // turned "l1\nl2\r\nl3\n" into all-CRLF — a whole-file change the plugin's own
+    // (EOL-blind) diff never showed. `eolMap` is a per-line terminator map
+    // ('l' = LF, 'c' = CRLF, 'n' = no terminator / EOF without a newline) aligned
+    // 1:1 with the line array. It is null for uniform files — the overwhelmingly
+    // common case — which keeps the legacy fast path byte-for-byte.
+    function eolMapOf(raw) {
+      if (typeof raw !== 'string' || raw.indexOf('\n') < 0) return null
+      // Count first: only a genuinely mixed file pays for the split.
+      let lf = 0
+      let crlf = 0
+      for (let i = raw.indexOf('\n'); i >= 0; i = raw.indexOf('\n', i + 1)) {
+        if (i > 0 && raw.charCodeAt(i - 1) === 13) crlf++
+        else lf++
+      }
+      if (lf === 0 || crlf === 0) return null
+      const segs = raw.split('\n')
+      const endsNL = raw.charCodeAt(raw.length - 1) === 10
+      const count = endsNL ? segs.length - 1 : segs.length
+      let out = ''
+      for (let i = 0; i < count; i++) {
+        if (i === count - 1 && !endsNL) { out += 'n'; continue }
+        out += segs[i].charCodeAt(segs[i].length - 1) === 13 ? 'c' : 'l'
+      }
+      return out
+    }
+    function dominantEolChar(eolMap, crlf) {
+      if (!eolMap) return crlf ? 'c' : 'l'
+      let c = 0
+      let l = 0
+      for (let i = 0; i < eolMap.length; i++) {
+        const ch = eolMap.charCodeAt(i)
+        if (ch === 99) c++
+        else if (ch === 108) l++
+      }
+      if (c === l) return crlf ? 'c' : 'l'
+      return c > l ? 'c' : 'l'
+    }
+    // Mirror of mergeHunks for the terminator map: the same reverse-order splice
+    // keeps the merged text and the merged map index-aligned.
+    //
+    // v1.32.7 (F6 fix): the LAST line's terminator follows the file's trailing
+    // newline state — the rule remapEolMap already applies. Filling every new
+    // line with `dom` added a trailing newline to a mixed-EOL file that had none
+    // (a byte the user never asked for, which the entry's `eol: false` then
+    // disagreed with).
+    function mergeEolMap(baseMap, hunks, decisions, trailingNL, crlf) {
+      if (!baseMap) return null
+      const out = baseMap.split('')
+      const dom = dominantEolChar(baseMap, crlf === true)
+      for (let i = hunks.length - 1; i >= 0; i--) {
+        const h = hunks[i]
+        if (decisions.get(h.id) === 'reject') continue
+        out.splice(h.oldStart, h.oldLen, ...new Array(h.newLines.length).fill(dom))
+      }
+      if (out.length > 0) out[out.length - 1] = trailingNL ? dom : 'n'
+      return out.join('')
+    }
+    // Map an old line array onto a new one through the Myers op stream the caller
+    // already computed for the edit fold.
+    //
+    // v1.32.7 (F6 fix): myersOps TRIMS the common prefix/suffix, so the stream
+    // covers only the changed region — the old `out.length !== newLen` test
+    // therefore returned null for every edit that keeps a first or last line,
+    // i.e. for virtually every real save, and the per-line map silently degraded
+    // to the uniform style (mixed-EOL file rewritten wholesale on Ctrl+S). The
+    // map is now rebuilt by pairing the RETAINED lines in order (skipping
+    // deletions, filling insertions), which is exactly the alignment the op
+    // stream encodes and is valid for a trimmed stream too. An inserted line
+    // continues the previous line's terminator; if that previous line was the
+    // old last line WITHOUT one ('n'), it must gain a terminator or the appended
+    // text would be glued onto it. Returns null only when the stream and the
+    // arrays disagree — every caller then falls back to the uniform style, i.e.
+    // exactly the pre-v1.33 behaviour.
+    function remapEolMap(oldMap, ops, newLen, trailingNL, crlf) {
+      if (!oldMap || !ops) return null
+      if (newLen === 0) return ''
+      const dom = dominantEolChar(oldMap, crlf)
+      const deleted = new Set()
+      const inserted = new Set()
+      for (const op of ops) {
+        if (op.t === 'd') deleted.add(op.i)
+        else if (op.t === 'i') inserted.add(op.j)
+      }
+      const out = []
+      let i = 0
+      for (let j = 0; j < newLen; j++) {
+        if (inserted.has(j)) {
+          // The line before an insertion now has a follower: a terminator-less
+          // ('n') predecessor has to gain one.
+          if (out.length > 0 && out[out.length - 1] === 'n') out[out.length - 1] = dom
+          out.push(out.length > 0 ? out[out.length - 1] : dom)
+          continue
+        }
+        while (i < oldMap.length && deleted.has(i)) i++
+        if (i >= oldMap.length) return null
+        out.push(oldMap[i])
+        i++
+      }
+      while (i < oldMap.length && deleted.has(i)) i++
+      if (i !== oldMap.length) return null
+      out[newLen - 1] = trailingNL ? dom : 'n'
+      return out.join('')
+    }
+    function joinLines(lines, trailingNL, crlf, eolMap) {
       if (lines.length === 0) return ''
+      if (eolMap && eolMap.length === lines.length) {
+        let out = ''
+        for (let i = 0; i < lines.length; i++) {
+          const ch = eolMap.charCodeAt(i)
+          out += lines[i]
+          if (ch === 99) out += '\r\n'
+          else if (ch === 108) out += '\n'
+        }
+        return out
+      }
       const sep = crlf ? '\r\n' : '\n'
       return lines.join(sep) + (trailingNL ? sep : '')
     }
@@ -327,6 +444,73 @@ export default {
       }
       if (p === '' || p.split('/').some((s) => s === '' || s === '.' || s === '..')) return null
       return p
+    }
+    // v1.34 (F2): the ONE entry point for a client-supplied workspace path.
+    // normalizeRelPath() already rejected absolute paths outside the root and
+    // every '..' segment — it was simply never wired to the RPC surface, so
+    // joinPath(root, path) resolved "../.." straight out of the workspace and a
+    // write RPC could replace any file the process may write. That is reachable
+    // by any local caller: the agent's own shell carries DSH_SESSION_ID and
+    // DSH_WEB_URL, and the sandbox vocabulary is file effects only (network is
+    // not confined), so the confined party can POST to this API itself.
+    function relPathArg(st, args) {
+      const raw = args && args.path !== undefined && args.path !== null ? String(args.path) : ''
+      return st && st.root ? normalizeRelPath(st.root, raw) : null
+    }
+    function badPath() {
+      return { ok: false, code: 'bad-path', message: '路径不在工作区内' }
+    }
+    // v1.34 (F7): the file TREE may browse any workspace DSH knows about, but not
+    // an arbitrary absolute path. The root override used to skip the session and
+    // the state entirely, so a caller with NO valid session could enumerate any
+    // directory on the host (listDir({sessionId:'x', root:'C:\\'}) returned a
+    // listing). The client only ever sends roots it got from ctx.workspaces, so
+    // gating on the host-side registry keeps the feature intact.
+    function workspaceRootsOf(ctxRef) {
+      let reg
+      try { reg = ctxRef.get('workspaceRegistry') } catch (e) { reg = undefined }
+      if (!reg || typeof reg.list !== 'function') return null
+      try {
+        const out = []
+        for (const w of reg.list()) {
+          const p = w && w.path
+          if (typeof p === 'string' && p !== '') out.push(p)
+        }
+        return out
+      } catch (e) {
+        return null
+      }
+    }
+    function samePathKey(a, b) {
+      return process.platform === 'win32' ? String(a).toLowerCase() === String(b).toLowerCase() : String(a) === String(b)
+    }
+    // A root override is legitimate only for a LIVE session and (when the
+    // deployment exposes the registry) for a root DSH itself registered. A
+    // deployment without the registry degrades to the session requirement —
+    // never back to "no check at all".
+    async function allowRootOverride(ctxRef, sid, rootPath, sessionRoot) {
+      const session = sessions.get(sid)
+      if (!session) return { ok: false, error: 'session-not-found' }
+      let want = rootPath
+      try { want = (await fs.resolve(rootPath)).targetKey } catch (e) { want = rootPath }
+      // The session's OWN workspace is always legitimate (a session may run in a
+      // directory the registry has no record of). The header cwd is the
+      // authority here — st.root is still null before the first scan, and
+      // gating a tree request on scan state would break the first expansion.
+      const ownRaw = (session.header && session.header.cwd) || sessionRoot
+      if (ownRaw) {
+        let own = ownRaw
+        try { own = (await fs.resolve(ownRaw)).targetKey } catch (e) { own = ownRaw }
+        if (samePathKey(own, want)) return { ok: true }
+      }
+      const roots = workspaceRootsOf(ctxRef)
+      if (roots === null) return { ok: true }
+      for (const p of roots) {
+        let have = p
+        try { have = (await fs.resolve(p)).targetKey } catch (e) { have = p }
+        if (samePathKey(have, want)) return { ok: true }
+      }
+      return { ok: false, error: 'root-not-a-workspace' }
     }
     // ---------- precise path extraction from shell/pwsh/git commands (v1.18) ----------
     // The whole-workspace walk is reserved for the 20s failsafe and for
@@ -494,7 +678,7 @@ export default {
       return base.endsWith('.md') || base.endsWith('.markdown')
     }
     function cloneEntry(e) {
-      return { present: e.present, content: e.content, eol: e.eol, crlf: e.crlf === true, version: e.version, size: e.size, note: e.note, binRef: e.binRef ?? null, binSize: e.binSize ?? 0, md: e.md === true, sig: e.sig ?? null, trunc: e.trunc ?? null, baselineRef: e.baselineRef ?? null, baselineBytes: e.baselineBytes ?? 0 }
+      return { present: e.present, content: e.content, eol: e.eol, crlf: e.crlf === true, eolMap: e.eolMap ?? null, version: e.version, size: e.size, note: e.note, binRef: e.binRef ?? null, binSize: e.binSize ?? 0, md: e.md === true, sig: e.sig ?? null, trunc: e.trunc ?? null, baselineRef: e.baselineRef ?? null, baselineBytes: e.baselineBytes ?? 0 }
     }
     // "File was not in the baseline" as an explicit ABSENT entry instead of
     // null: every consumer (modifiedFiles / diffPayload / reject paths) then
@@ -502,7 +686,7 @@ export default {
     // newly created files render as one big "added" hunk and lets reject
     // restore the pre-file state (delete it).
     function absentEntry() {
-      return { present: false, content: null, eol: false, crlf: false, version: null, size: 0, note: undefined, binRef: null, binSize: 0, md: false, sig: null, trunc: null }
+      return { present: false, content: null, eol: false, crlf: false, eolMap: null, version: null, size: 0, note: undefined, binRef: null, binSize: 0, md: false, sig: null, trunc: null }
     }
     // Shared shape for "this file is gone" (deletion sweep, targeted refresh,
     // reject of a created file): one place to keep the entry fields in sync.
@@ -510,7 +694,7 @@ export default {
     // never-baselined path) so the deleted branch of the payload — not a note —
     // is what renders it.
     function goneEntry() {
-      return { present: false, content: null, eol: false, crlf: false, version: null, size: 0, binRef: null, binSize: 0, md: false, sig: null, trunc: null }
+      return { present: false, content: null, eol: false, crlf: false, eolMap: null, version: null, size: 0, binRef: null, binSize: 0, md: false, sig: null, trunc: null }
     }
 
     // ---------- line diff (Myers + anchored fallback) ----------
@@ -741,48 +925,357 @@ export default {
         }
       } catch (e) {}
     }
-    function saveState(st) {
+    // v1.32.3 PERF: two things made persistence the last real stall of the DIFF
+    // feature on a big workspace, and both are fixed here.
+    //
+    //  * The payload is built ONCE per generation (`files` object + JSON text)
+    //    and NEVER on the event loop in a blocking write. v1.18 already moved the
+    //    serialize behind a 250ms debounce, but the write itself stayed
+    //    `writeFileSync`: on the real module-one session (34,252 entries, 263MB
+    //    state, 83MB of JSON) that is a ~130ms synchronous write plus a ~195ms
+    //    JSON.stringify, i.e. ~350ms during which the whole plugin — and every
+    //    other request the DSH web server is serving — is frozen. The write now
+    //    goes through an ordered per-session async queue with a temp-file +
+    //    rename (atomic, so a crash mid-write can never leave a truncated state).
+    //
+    //  * A save whose content is IDENTICAL to what is already on disk is skipped.
+    //    The debounced path is reached by read-driven flows too (a scan that only
+    //    bumped a version, an accept that folded to the same bytes), and
+    //    re-serializing ~83MB for an unchanged map is pure waste. The stamp is a
+    //    cheap fingerprint of the persisted payload, so a false "unchanged" is
+    //    impossible: any differing entry changes at least one component.
+    const saveChain = new Map()   // sid -> Promise (ordered writes per session)
+    const lastSaveStamp = new Map() // sid -> { stamp, bytes }
+    // The fingerprint covers everything the payload carries: the file set, each
+    // entry's revision + decision count, and the undo record. Note that the two
+    // blob markers (`baselineRef`, `binRef`) are mutated in place WITHOUT a rev
+    // bump by the snapshot helpers, so their presence is folded in separately —
+    // otherwise a blob that just became restorable would look "unchanged".
+    function stateStamp(st) {
+      let h = 2166136261
+      let refs = 0
+      let noteLarge = 0
+      const mix = (n) => { h ^= (n | 0); h = Math.imul(h, 16777619) }
+      mix(st.files.size)
+      for (const entry of st.files) {
+        const f = entry[1]
+        mix(f.rev)
+        mix(f.decisions.size)
+        if (f.base && (f.base.binRef || f.base.baselineRef)) refs++
+        if (f.cur && (f.cur.binRef || f.cur.baselineRef)) refs++
+        if (f.cur && f.cur.content === null) noteLarge++
+        const name = entry[0]
+        for (let i = 0; i < name.length; i++) mix(name.charCodeAt(i))
+      }
+      mix(refs)
+      mix(noteLarge)
+      mix(st.baseReady ? 1 : 0)
+      mix(st.lastReject ? (st.lastReject.files ? st.lastReject.files.length : 0) + 1 : 0)
+      if (st.root) for (let i = 0; i < st.root.length; i++) mix(st.root.charCodeAt(i))
+      return (h >>> 0).toString(36)
+    }
+    // Build the persisted payload. Split out so the synchronous (force/teardown)
+    // path and the queued path serialize exactly the same thing.
+    function statePayload(st) {
+      const files = {}
+      for (const entry of st.files) {
+        const base = entry[1].base
+        const cur = entry[1].cur
+        // v1.18: a clean file needs only its baseline persisted — loadState
+        // reconstructs cur as a clone of it. Big workspaces (15K entries,
+        // BM_automation) used to serialize EVERY file's content twice;
+        // halving the state blob is what makes per-file accept/reject saves
+        // tolerable on the debounced path. v1.29: "clean" is entrySame, the
+        // same content-first rule the review itself uses (an EOL-only flip is
+        // clean even though its version token moved). v1.32.3: with the
+        // identity fast path in entrySame this is now O(1) for the dominant
+        // case (base === cur), which is most of the map.
+        const redundantCur = entrySame(base, cur)
+        files[entry[0]] = {
+          base: base,
+          cur: redundantCur ? undefined : cur,
+          rev: entry[1].rev,
+          decisions: Object.fromEntries(entry[1].decisions),
+        }
+      }
+      return { root: st.root, baseReady: st.baseReady, files, lastReject: st.lastReject ?? null }
+    }
+    // GC: drop blob files no longer referenced by any entry. Two kinds live
+    // here: binary snapshots (binRef) and v1.31 large-TEXT baseline snapshots
+    // (baselineRef, what makes a big text file rejectable without keeping its
+    // content in memory).
+    function gcBlobs(st) {
       try {
-        const files = {}
+        const dir = blobRoot(st.sid)
+        if (!existsSync(dir)) return
+        const refs = new Set()
         for (const entry of st.files) {
-          const base = entry[1].base
-          const cur = entry[1].cur
-          // v1.18: a clean file needs only its baseline persisted — loadState
-          // reconstructs cur as a clone of it. Big workspaces (15K entries,
-          // BM_automation) used to serialize EVERY file's content twice;
-          // halving the state blob is what makes per-file accept/reject saves
-          // tolerable on the debounced path. v1.29: "clean" is entrySame, the
-          // same content-first rule the review itself uses (an EOL-only flip is
-          // clean even though its version token moved).
-          const redundantCur = entrySame(base, cur)
-          files[entry[0]] = {
-            base: base,
-            cur: redundantCur ? undefined : cur,
-            rev: entry[1].rev,
-            decisions: Object.fromEntries(entry[1].decisions),
+          const f = entry[1]
+          if (f.base && f.base.binRef) refs.add(f.base.binRef)
+          if (f.cur && f.cur.binRef) refs.add(f.cur.binRef)
+          if (f.base && f.base.baselineRef) refs.add(f.base.baselineRef)
+          if (f.cur && f.cur.baselineRef) refs.add(f.cur.baselineRef)
+        }
+        for (const name of readdirSync(dir)) {
+          if (!refs.has(name)) { try { rmSync(join(dir, name), { force: true }) } catch (e) {} }
+        }
+      } catch (e) {}
+    }
+    // Hand the JSON payload to the session's write queue. Writes are serialized
+    // per session (a temp file can only hold one generation at a time) and the
+    // LAST queued generation always wins, so a burst of accepts costs one rename.
+    // `after` runs once this generation is on disk (the blob GC rides it so the
+    // 21K-file readdir never shares a tick with a user-visible RPC).
+    //
+    // A payload is an ARRAY of string pieces, never one concatenated string:
+    // `parts.join('')` over the 600-odd serialization batches copies the whole
+    // 244MB payload into a fresh flat string (~75ms of straight CPU), and the
+    // first chunked `slice()` of that rope then flattens it a second time.
+    // Writing the pieces as they are skips both copies — same bytes on disk.
+    function payloadChars(payload) {
+      if (typeof payload === 'string') return payload.length
+      let n = 0
+      for (const p of payload) n += p.length
+      return n
+    }
+    // Small payloads still go through the same temp+rename discipline (the write
+    // itself is one call, so it cannot be interrupted by the event loop).
+    function writeJsonSync(tmp, file, payload) {
+      writeFileSync(tmp, typeof payload === 'string' ? payload : payload.join(''))
+      renameSync(tmp, file)
+    }
+    // v1.32.3 FIX (data loss): every chunk must be appended at the CURRENT file
+    // offset. `fh.write(text, 0, 'utf8')` is the string overload's
+    // `(position, encoding)` form, and that 0 is an ABSOLUTE offset — so each
+    // chunk overwrote the file from byte 0 and the renamed file kept only the
+    // LAST chunk. That is exactly how a complete 263MB state became a 4.6MB
+    // fragment on disk while every "saved" check still passed (they were reading
+    // the untouched previous file). `null` means "append at the current offset".
+    //
+    // v1.32.3 PERF: the loop also yields explicitly on a time budget. Awaiting
+    // `fh.write` is not guaranteed to hand the loop back to its timer phase, and
+    // on the real 263MB state the whole 3.6s write ran without a single timer
+    // tick. The yield bounds the damage to one chunk per turn.
+    const WRITE_CHUNK_CHARS = 1024 * 1024
+    const WRITE_YIELD_MS = 4
+    async function writeJsonAtomic(tmp, file, payload) {
+      const pieces = typeof payload === 'string' ? [payload] : payload
+      const fh = await openP(tmp, 'w')
+      try {
+        let yieldAt = performance.now() + WRITE_YIELD_MS
+        for (const piece of pieces) {
+          if (piece.length <= WRITE_CHUNK_CHARS) {
+            await fh.write(piece, null, 'utf8')
+            if (performance.now() >= yieldAt) { yieldAt = performance.now() + WRITE_YIELD_MS; await new Promise((r) => setImmediate(r)) }
+            continue
+          }
+          for (let i = 0; i < piece.length; i += WRITE_CHUNK_CHARS) {
+            await fh.write(piece.slice(i, i + WRITE_CHUNK_CHARS), null, 'utf8')
+            if (performance.now() >= yieldAt) { yieldAt = performance.now() + WRITE_YIELD_MS; await new Promise((r) => setImmediate(r)) }
           }
         }
-        writeFileSync(stateFile(st.sid), JSON.stringify({ root: st.root, baseReady: st.baseReady, files, lastReject: st.lastReject ?? null }))
-        // GC: drop blob files no longer referenced by any entry. Two kinds live
-        // here: binary snapshots (binRef) and v1.31 large-TEXT baseline
-        // snapshots (baselineRef, what makes a big text file rejectable without
-        // keeping its content in memory).
-        try {
-          const dir = blobRoot(st.sid)
-          if (existsSync(dir)) {
-            const refs = new Set()
-            for (const entry of st.files) {
-              const f = entry[1]
-              if (f.base && f.base.binRef) refs.add(f.base.binRef)
-              if (f.cur && f.cur.binRef) refs.add(f.cur.binRef)
-              if (f.base && f.base.baselineRef) refs.add(f.base.baselineRef)
-              if (f.cur && f.cur.baselineRef) refs.add(f.cur.baselineRef)
+        // fsync before the handle closes. Without it a crash can leave the
+        // RENAMED file full of zeros (or short) even though the rename itself
+        // was atomic — the failure mode that produced a truncated state file.
+        await fh.datasync()
+      } catch (e) {
+        try { await fh.close() } catch (e2) {}
+        throw e
+      }
+      await fh.close()
+      // Atomic publish: a crash (or a kill) mid-write leaves the previous
+      // complete state in place instead of a truncated file.
+      renameSync(tmp, file)
+    }
+    function enqueueStateWrite(st, payload, after) {
+      const sid = st.sid
+      const file = stateFile(sid)
+      // One temp name per queued generation: two in-flight payloads must never
+      // share a file, or the abandoned one could tear the winner's write.
+      const tmp = file + '.' + process.pid + '.' + (writeSeq++) + '.tmp'
+      const prev = saveChain.get(sid) || Promise.resolve()
+      const next = prev
+        .then(() => {
+          // Superseded by the synchronous path (reject / teardown flush): that
+          // write is the newer, authoritative one — never publish this older
+          // payload on top of it, and never leave its temp file behind.
+          if (abandonedSaves.has(sid)) return
+          return writeJsonAtomic(tmp, file, payload).then(() => { if (after) after() })
+        })
+        .catch((e) => {
+          try { rmSync(tmp, { force: true }) } catch (e2) {}
+          console.error('[dsh-file-edit] async saveState failed:', e && e.message ? e.message : e)
+        })
+      abandonedSaves.delete(sid)
+      saveChain.set(sid, next)
+      return next
+    }
+    let writeSeq = 0
+    const abandonedSaves = new Set()
+    // The synchronous variant: only for the paths that must be durable BEFORE
+    // the call returns (reject / undo-reject, whose undo record is the whole
+    // point, and the teardown flush).
+    //
+    // v1.32.3 CRASH SAFETY: this used to write the LIVE state file directly with
+    // `writeFileSync`. A 263MB write takes tens of milliseconds, and the process
+    // can die inside it (an OOM kill, a Ctrl+C, a Windows termination): the
+    // result is a truncated file that is not JSON at all, i.e. the session loses
+    // its entire review baseline — the exact failure observed in the wild
+    // (session-171ba65f…, 263MB reduced to a 4.5MB fragment). Every path now
+    // writes a temp file and renames it over the target, so the worst case is
+    // "the previous complete state survives".
+    function saveStateSync(st, payload) {
+      const sid = st.sid
+      const file = stateFile(sid)
+      const tmp = file + '.' + process.pid + '.' + (writeSeq++) + '.tmp'
+      try {
+        // The direct write is the FINAL word: abandon the run's temp file before
+        // writing, and mark the chain so a queued (now older) payload is dropped
+        // instead of resurrecting pre-teardown state after the flush.
+        const run = st.saveRun
+        if (run && run.active) {
+          run.active = false
+          if (st.saveRun === run) st.saveRun = null
+        }
+        if (saveChain.has(sid)) { saveChain.delete(sid); abandonedSaves.add(sid) }
+        writeJsonSync(tmp, file, JSON.stringify(payload))
+        lastSaveStamp.set(sid, { stamp: stateStamp(st) })
+        gcBlobs(st)
+      } catch (e) {
+        try { rmSync(tmp, { force: true }) } catch (e2) {}
+        console.error('[dsh-file-edit] saveState failed:', e)
+      }
+    }
+    // v1.32.3 PERF: the debounced save builds its JSON text in TIME-SLICED
+    // CHUNKS. `JSON.stringify` over the whole 83MB payload is ~200ms of straight
+    // CPU, and it was the last thing in this plugin that could park the event
+    // loop long enough to be felt as a freeze (it runs ~250ms after every accept,
+    // i.e. right when the user is looking at the result). Each chunk serializes
+    // its own entries with the native stringifier (so the bytes are identical to
+    // the single-pass result) and the run yields as soon as it has spent ~6ms.
+    //
+    // Consistency: entries are read from the LIVE map, so a payload is only
+    // complete if the map did not change shape while the run was in flight. The
+    // entry count is the cheap witness of that (entry REVISIONS only move from a
+    // mutation, and the debounce already guarantees the run starts after the
+    // mutation that triggered it), and a mismatch simply restarts the run against
+    // the newer map — after this run's write, so the newest state always wins.
+    const SAVE_CHUNK_MS = 6
+    function saveRunActive(st) {
+      return !!(st.saveRun && st.saveRun.active)
+    }
+    function finishSaveRun(st, run) {
+      if (!run.active) return
+      run.active = false
+      if (st.saveRun === run) st.saveRun = null
+      if (st.files.size !== run.keys.length) {
+        // The file set moved under the run: throw this payload away and
+        // re-serialize the newer map.
+        st.saveDirty = false
+        return
+      }
+      // The payload stays an ARRAY of pieces all the way to the writer: joining
+      // the ~600 serialization batches into one 244MB string is ~75ms of
+      // straight CPU, and the first chunked `slice()` of that rope then flattens
+      // it a second time. Handing the pieces over skips both copies.
+      const parts = run.parts.concat([run.tail])
+      // The stamp is taken here, immediately after the last chunk: anything a
+      // chunk already captured is in this payload, so a mutation during the run
+      // is never lost (its entry is serialized from the live object).
+      lastSaveStamp.set(st.sid, { stamp: stateStamp(st) })
+      st.saveDirty = false
+      const gen = st.saveGen || 0
+      void enqueueStateWrite(st, parts, () => gcBlobs(st)).then(() => {
+        // A mutation landed while this run serialized: persist it too.
+        if ((st.saveGen || 0) !== gen && !saveRunActive(st)) void startSaveRun(st)
+      })
+    }
+    const SAVE_BATCH_PARTS = 64
+    function stepSaveRun(st, run) {
+      return new Promise((resolve) => {
+        setImmediate(() => {
+          if (!run.active) { resolve(); return }
+          try {
+            const t0 = performance.now()
+            // Entries accumulate in a small batch first: one `join` per batch
+            // keeps `run.parts` at a few hundred elements instead of 34K, which
+            // is what makes the final concatenation cheap.
+            const batch = []
+            for (;;) {
+              if (run.i >= run.keys.length) {
+                if (batch.length > 0) run.parts.push(batch.join(''))
+                finishSaveRun(st, run)
+                resolve()
+                return
+              }
+              const key = run.keys[run.i++]
+              const f = st.files.get(key)
+              // The entry vanished from the map mid-run: it must not be written
+              // (the restart above re-serializes the newer map).
+              if (!f) continue
+              if (f.base === undefined && f.cur === undefined) continue
+              batch.push((run.count === 0 ? '' : ',') + JSON.stringify(key) + ':' + JSON.stringify({
+                base: f.base,
+                cur: entrySame(f.base, f.cur) ? undefined : f.cur,
+                rev: f.rev,
+                decisions: Object.fromEntries(f.decisions),
+              }))
+              run.count++
+              if (batch.length >= SAVE_BATCH_PARTS) {
+                run.parts.push(batch.join(''))
+                batch.length = 0
+              }
+              // v1.32.3: the budget is checked after EVERY entry, not every N.
+              // One 18MB entry (drawingfile_ie.js) is a ~100ms JSON.stringify on
+              // its own, so a 256-entry granularity never looked at the clock
+              // before a whole chunk was already spent; now a heavy entry yields
+              // immediately instead of sharing its tick with the next ones.
+              if (performance.now() - t0 >= SAVE_CHUNK_MS) {
+                if (batch.length > 0) { run.parts.push(batch.join('')); batch.length = 0 }
+                stepSaveRun(st, run).then(resolve)
+                return
+              }
             }
-            for (const name of readdirSync(dir)) {
-              if (!refs.has(name)) { try { rmSync(join(dir, name), { force: true }) } catch (e) {} }
-            }
+          } catch (e) {
+            run.active = false
+            if (st.saveRun === run) st.saveRun = null
+            console.error('[dsh-file-edit] saveState failed:', e)
+            resolve()
           }
-        } catch (e) {}
+        })
+      })
+    }
+    function startSaveRun(st) {
+      // {"root":…,"baseReady":…  +  ,"files":{  +  <entries>  +  },"lastReject":…}
+      const head = JSON.stringify({ root: st.root ?? null, baseReady: st.baseReady === true }).slice(0, -1)
+      const run = {
+        active: true,
+        keys: Array.from(st.files.keys()),
+        i: 0,
+        count: 0,
+        parts: [head, ',"files":{'],
+        tail: '},"lastReject":' + JSON.stringify(st.lastReject ?? null) + '}',
+      }
+      st.saveRun = run
+      st.saveGen = st.saveGen || 0
+      return stepSaveRun(st, run)
+    }
+    // v1.32.3: `opts.force` keeps the OLD blocking semantics for the destructive
+    // paths (their undo record is the whole point); the debounced path slices the
+    // serialization and writes asynchronously, so the RPC that asked for the save
+    // has long returned and the event loop is never parked on 80MB+ of JSON.
+    function saveState(st, opts) {
+      try {
+        const force = !!(opts && opts.force)
+        // A save run already in flight for this session persists a NEWER map than
+        // a second run started now would — never run two at once.
+        if (!force && saveRunActive(st)) return
+        const stamp = stateStamp(st)
+        const last = lastSaveStamp.get(st.sid)
+        // Nothing the payload would carry has changed since the last save.
+        if (!force && last && last.stamp === stamp) return
+        if (force) { saveStateSync(st, statePayload(st)); return }
+        void startSaveRun(st)
       } catch (e) {
         console.error('[dsh-file-edit] saveState failed:', e)
       }
@@ -795,19 +1288,59 @@ export default {
     // paths (reject / undo-reject / hunk-reject) pass force=true: their undo
     // records must hit disk immediately. The teardown effect flushes any
     // pending save so a stop/update cannot drop the last accept.
+    // v1.32.3: force now means "write synchronously BEFORE returning" (the old
+    // behaviour, kept for the destructive paths); the debounced path serializes
+    // once and hands the text to the async write queue.
     const saveTimers = new Map()
     function scheduleSave(st, force) {
       const sid = st.sid
       const existing = saveTimers.get(sid)
       if (existing) { clearTimeout(existing.t); saveTimers.delete(sid) }
-      if (force) { saveState(st); return }
+      if (force) { saveState(st, { force: true }); return }
       saveTimers.set(sid, { st: st, t: setTimeout(() => { saveTimers.delete(sid); saveState(st) }, 250) })
     }
-    function loadState(sid) {
+    // v1.32.3 CRASH RECOVERY: a state file that cannot be parsed used to be
+    // swallowed by this catch, so a truncated/corrupt file silently started the
+    // session from an EMPTY map — the review pane then showed nothing (or a
+    // full-workspace "everything changed") with no explanation, and the first
+    // save overwrote the evidence. Now the bad file is QUARANTINED (renamed
+    // aside, never deleted) and the failure is reported, so the next save
+    // rebuilds a clean baseline from disk instead of looping on the same parse
+    // error. Written atomically by saveState, so a corrupt file now means real
+    // damage (a killed process, a bad disk) rather than a normal crash.
+    function quarantineStateFile(sid, why) {
       try {
-        const raw = readFileSync(stateFile(sid), 'utf8')
-        const data = JSON.parse(raw)
-        if (!data || typeof data !== 'object') return null
+        const from = stateFile(sid)
+        if (!existsSync(from)) return null
+        const to = from + '.corrupt-' + Date.now()
+        renameSync(from, to)
+        console.error('[dsh-file-edit] state file was not readable (' + why + '); moved aside to ' + to)
+        return to
+      } catch (e) {
+        console.error('[dsh-file-edit] could not quarantine the unreadable state file:', e && e.message ? e.message : e)
+        return null
+      }
+    }
+    function loadState(sid) {
+      let raw
+      try {
+        raw = readFileSync(stateFile(sid), 'utf8')
+      } catch (e) {
+        // No state yet is NORMAL (first run of a session), not damage.
+        return null
+      }
+      let data
+      try {
+        data = JSON.parse(raw)
+      } catch (e) {
+        quarantineStateFile(sid, e && e.message ? e.message : String(e))
+        return null
+      }
+      try {
+        if (!data || typeof data !== 'object') {
+          quarantineStateFile(sid, 'not a JSON object')
+          return null
+        }
         const files = new Map()
         for (const key of Object.keys(data.files ?? {})) {
           const f = data.files[key]
@@ -816,11 +1349,15 @@ export default {
           const base = f.base ?? absentEntry()
           if (base.crlf === undefined) base.crlf = false
           if (typeof base.binRef !== 'string') base.binRef = null
+          // v1.33: a legacy (pre-eolMap) state simply has no per-line EOL map;
+          // null is the "uniform file" answer and keeps the legacy write path.
+          if (typeof base.eolMap !== 'string') base.eolMap = null
           // v1.18: clean files persist only their baseline; reconstruct the
           // redundant cur as a clone of it.
           const cur = f.cur ?? (base ? cloneEntry(base) : null)
           if (cur && cur.crlf === undefined) cur.crlf = false
           if (cur && typeof cur.binRef !== 'string') cur.binRef = null
+          if (cur && typeof cur.eolMap !== 'string') cur.eolMap = null
           files.set(key, {
             base: base,
             cur: cur,
@@ -834,6 +1371,8 @@ export default {
           : null
         return { root: data.root ?? null, baseReady: data.baseReady === true, files, lastReject }
       } catch (e) {
+        // Parsed but structurally unusable: same treatment as unparseable.
+        quarantineStateFile(sid, 'unusable structure: ' + (e && e.message ? e.message : String(e)))
         return null
       }
     }
@@ -858,6 +1397,13 @@ export default {
         // (persisting attribution across restarts would be wrong: a fresh
         // page/turn should not re-review already-folded user files).
         touched: new Set(),
+        // v1.33 (F1): paths the write tool itself reported as `operation:
+        // 'create'`. Positive proof of "the AGENT created this file", which is
+        // the ONLY condition under which a reject may delete a file (see
+        // doReject / assertDeletable). Process-local on purpose, like `touched`:
+        // after a restart the proof is gone and reject refuses instead of
+        // destroying a file whose pre-image was never observed.
+        created: new Set(),
         shellWindow: false,
         // v1.18 precise DIFF refresh: `pendingTargets` is either a Set of
         // workspace-relative paths the next resolution should refresh
@@ -1073,7 +1619,7 @@ export default {
         const held = baselineBufs.get(entry.sig.h)
         if (held) {
           if (held.length !== entry.sig.n) return done(false)
-          writeFileSync(blobPath, held)
+          writeBytesAtomicSync(blobPath, held)
           entry.baselineRef = ref
           entry.baselineBytes = entry.sig.n
           return done(true)
@@ -1114,12 +1660,12 @@ export default {
       // tier where that is true.
       if (info.size > MAX_SIG_BYTES) {
         const fp = await sigFor(target, info.size)
-        return { present: true, content: null, eol: false, crlf: false, version: info.version, size: info.size, note: 'large', trunc: fp.trunc, binRef: null, binSize: 0, md: md }
+        return { present: true, content: null, eol: false, crlf: false, eolMap: null, version: info.version, size: info.size, note: 'large', trunc: fp.trunc, binRef: null, binSize: 0, md: md }
       }
       try {
         const text = await fs.readText(target)
         const content = text.replace(/\r\n/g, '\n')
-        const entry = { present: true, content: content, eol: text.endsWith('\n'), crlf: /\r\n/.test(text), version: info.version, size: info.size, binRef: null, binSize: 0, md: md }
+        const entry = { present: true, content: content, eol: text.endsWith('\n'), crlf: /\r\n/.test(text), eolMap: eolMapOf(text), version: info.version, size: info.size, binRef: null, binSize: 0, md: md }
         // v1.31: with the content in hand, the fingerprint costs one hash — and it
         // is what makes the baseline snapshot race-free: the blob is written from
         // THESE bytes the moment they are known to be the baseline, so a later
@@ -1141,16 +1687,39 @@ export default {
             const blobPath = join(blobRoot(st.sid), hash)
             if (!existsSync(blobPath)) {
               mkdirSync(blobRoot(st.sid), { recursive: true })
-              writeFileSync(blobPath, bytes)
+              // v1.34 (F5): a truncated BASELINE blob would be restored as file
+              // content by a later reject — publish it atomically.
+              writeBytesAtomicSync(blobPath, bytes)
             }
             binRef = hash
             binSize = bytes.length
           } catch (e2) { binRef = null }
         }
-        return { present: true, content: null, eol: false, crlf: false, version: info.version, size: info.size, note: 'binary', binRef: binRef, binSize: binSize, md: md }
+        return { present: true, content: null, eol: false, crlf: false, eolMap: null, version: info.version, size: info.size, note: 'binary', binRef: binRef, binSize: binSize, md: md }
       }
     }
 
+    // v1.32.7 (F3 fix): "the content did not change" must NOT freeze the stat
+    // token. v1.29's keep-the-old-entry rule (refreshOne / getDiff /
+    // saveUserFile) is about not re-rendering for an identical rewrite, and it
+    // still holds — but the token it kept is the SAME token the F3 write guard
+    // (`replaceIfVersion`) compares against the disk. Once the disk moved on
+    // (an identical rewrite by the agent's own write/edit tool, a CRLF<->LF
+    // flip, a formatter or git touching the file), every later write was
+    // refused with FS_STALE_VERSION and NO refresh could ever heal the entry:
+    // a permanent per-file write lock. Content equality is decided by
+    // entrySame (content / LF-normalized fingerprint), so adopting the freshly
+    // observed identity here cannot hide a real change — an entry whose
+    // equality would fall back to the version token (binary, sampled) never
+    // reaches this call with a moved token.
+    function adoptIdentity(cur, next) {
+      if (!cur || !next || !cur.present || !next.present) return
+      if (cur.version === next.version && cur.size === next.size) return
+      // Only a content/fingerprint verdict may carry an identity forward.
+      if (next.content === null && !next.sig) return
+      cur.version = next.version
+      cur.size = next.size
+    }
     async function refreshOne(st, rel, w) {
       let f = st.files.get(rel)
       if (!f) { f = { base: null, cur: null, rev: 0, decisions: new Map() }; st.files.set(rel, f) }
@@ -1167,9 +1736,12 @@ export default {
       // v1.31: `rev` still moves — the stat identity did change, and `rev` is
       // also the per-entry content generation the stats cache keys on (a
       // separate, liveness-only counter would need to be threaded through every
-      // entry). What stays put is the CONTENT and the version token, which is
-      // what "unchanged" has to mean for isChanged / isPending.
-      f.cur = entrySame(f.cur, next) ? f.cur : next
+      // entry). What stays put is the CONTENT, which is what "unchanged" has to
+      // mean for isChanged / isPending.
+      // v1.32.7: the identity does NOT stay put (see adoptIdentity) — keeping it
+      // was what turned a same-content stat bump into an unwritable file.
+      if (entrySame(f.cur, next)) adoptIdentity(f.cur, next)
+      else f.cur = next
       f.rev++
       return f
     }
@@ -1256,6 +1828,9 @@ export default {
                 !pending && !attrib(w.rel) && !entrySame(beforeCur, f.cur)) {
               f.base = cloneEntry(f.cur)
               armBaseline(st, w.rel, f)
+              // v1.32.7 (F1 hygiene): this path now HAS a real baseline, so the
+              // create proof for it is spent (see doAccept).
+              st.created.delete(w.rel)
               if (f.decisions.size > 0) f.decisions.clear()
               f.rev++
             }
@@ -1403,10 +1978,14 @@ export default {
               const next = await loadFileEntry(st, rel, f.cur)
               // v1.29: identical text (including a pure CRLF/LF flip) keeps the
               // existing entry, so no rev bump and no spurious review.
+              // v1.32.7: but its identity token advances (adoptIdentity) — the
+              // F3 write guard must compare against what the disk really holds.
               if (!entrySame(f.cur, next)) {
                 if (f.decisions.size > 0) { f.decisions.clear(); f.rev++ }
                 f.cur = next
                 f.rev++
+              } else {
+                adoptIdentity(f.cur, next)
               }
             }
             if (!before) st.files.set(rel, f)
@@ -1425,6 +2004,8 @@ export default {
                 !pending && !attrib && !entrySame(beforeCur, f.cur)) {
               f.base = cloneEntry(f.cur)
               armBaseline(st, rel, f)
+              // v1.32.7 (F1 hygiene): a real baseline now exists for this path.
+              st.created.delete(rel)
               if (f.decisions.size > 0) f.decisions.clear()
               f.rev++
             }
@@ -1947,12 +2528,14 @@ export default {
       if (entry.size > MAX_SIG_BYTES && !entry.baselineRef) return
       try {
         let text
+        let fromBlob = false
         if (entry.baselineRef) {
           const blob = join(blobRoot(st.sid), entry.baselineRef)
           if (!existsSync(blob)) return
           entry.loading = true
           text = readFileSync(blob, 'utf8')
           entry.loading = false
+          fromBlob = true
         } else {
           const target = await fs.resolve(joinPath(root, rel))
           entry.loading = true
@@ -1960,8 +2543,16 @@ export default {
           entry.loading = false
         }
         entry.content = text.replace(/\r\n/g, '\n')
-        entry.eol = text.endsWith('\n')
-        entry.crlf = /\r\n/.test(text)
+        // v1.33 (F6): a baseline blob holds LF-NORMALIZED bytes (streamNormalized
+        // mirrors the normalized text), so re-deriving the write style from it
+        // would silently turn a CRLF baseline into an LF one and make the next
+        // reject flip every line ending of the restored file. The style is read
+        // from the FILE only; a blob load keeps what the entry already knows.
+        if (!fromBlob) {
+          entry.eol = text.endsWith('\n')
+          entry.crlf = /\r\n/.test(text)
+          entry.eolMap = eolMapOf(text)
+        }
         // The fingerprint is KEPT alongside the content: equality can then be
         // settled by a hash instead of re-walking two line arrays, and it costs
         // two short strings in memory (never in the state file — saveState picks
@@ -2075,6 +2666,12 @@ export default {
     //     observation => changed (a file that became readable is a transition).
     function entrySame(a, b) {
       if (!a || !b) return a === b
+      // v1.32.3 PERF: the SAME object is trivially equal, and this is the
+      // dominant case in the whole review map — a clean entry keeps base === cur
+      // for its lifetime, and accepting a file assigns `f.base = cloneEntry(f.cur)`
+      // which the next sweep compares again. Without this line every 6s poll and
+      // every acceptAll walked all 34K entries into a content comparison.
+      if (a === b) return true
       if (a.present !== b.present) return false
       if (!a.present) return true
       if ((a.note || null) !== (b.note || null)) return false
@@ -2103,12 +2700,48 @@ export default {
       if (a.trunc && b.trunc) return sameSig(a.trunc, b.trunc)
       return a.version === b.version
     }
+    // v1.32.3 PERF: "do these two texts have the same lines?" — the hot
+    // predicate of the whole review (modifiedFiles calls it for EVERY entry on
+    // every poll, acceptAll twice per click). The previous implementation
+    // allocated two line ARRAYS for every comparison, even for the overwhelmingly
+    // common case of two byte-identical normalized strings; on a 34K-entry /
+    // 263MB module-one state that was 25K splitLines calls and ~220ms of pure
+    // allocation per sweep. Now the identical case is a single memcmp and no
+    // array is built at all; only genuinely different texts fall through to the
+    // line walk, and that walk streams instead of allocating.
+    //
+    // Equivalence with splitLines (the definition of "same lines" used
+    // everywhere else): compare the LF-normalized texts first (that alone
+    // settles CRLF-vs-LF and a final-newline-only difference), then compare line
+    // by line without materializing the arrays. splitLines drops exactly one
+    // trailing empty line, which is what the explicit "the last line ends the
+    // string" tests below reproduce.
     function linesEqual(x, y) {
-      const la = splitLines(x)
-      const lb = splitLines(y)
-      if (la.length !== lb.length) return false
-      for (let i = 0; i < la.length; i++) if (la[i] !== lb[i]) return false
-      return true
+      if (x === y) return true
+      if (x === null || y === null || x === undefined || y === undefined) return false
+      // splitLines returns [] for an empty string, which is NOT the same as [""]
+      // (the line list of "\n"), so the falsy case keeps its own answer.
+      if (!x || !y) return !x && !y
+      let a = x.indexOf('\r') >= 0 ? x.replace(/\r\n/g, '\n') : x
+      let b = y.indexOf('\r') >= 0 ? y.replace(/\r\n/g, '\n') : y
+      // splitLines drops the final empty line: the terminator of the last line
+      // is not content, so "a", "a\n" and "a\r\n" are the same single line.
+      if (a.charCodeAt(a.length - 1) === 10) a = a.slice(0, -1)
+      if (b.charCodeAt(b.length - 1) === 10) b = b.slice(0, -1)
+      if (a === b) return true
+      const la = a.length, lb = b.length
+      let i = 0, j = 0
+      for (;;) {
+        const na = a.indexOf('\n', i)
+        const nb = b.indexOf('\n', j)
+        const ea = na < 0 ? la : na
+        const eb = nb < 0 ? lb : nb
+        if (ea - i !== eb - j) return false
+        for (let k = 0; k < ea - i; k++) if (a.charCodeAt(i + k) !== b.charCodeAt(j + k)) return false
+        if (ea === la || eb === lb) return ea === la && eb === lb
+        i = ea + 1
+        j = eb + 1
+      }
     }
     function linesOf(entry) {
       return entry && entry.present && entry.content !== null ? splitLines(entry.content) : []
@@ -2215,41 +2848,67 @@ export default {
       } catch (e) {}
       return st.policy ?? undefined
     }
-    async function writeFile(st, rel, content) {
+    // v1.33 (F3): every write now carries the version its content was built from.
+    // `fs.writeText`'s `replaceIfVersion` / `createIfAbsent` intent turns a
+    // concurrent (never-observed) change into FS_STALE_VERSION instead of a silent
+    // overwrite. The plugin's own `rev` only guards against a STALE CLIENT — it
+    // says nothing about the disk moving on beneath the in-memory state (an
+    // unobserved external edit, another session on the same workspace, a build
+    // step), which is exactly how a reject used to discard newer content.
+    async function writeFile(st, rel, content, guard) {
       const target = await fs.resolve(joinPath(st.root, rel))
-      const outcome = await fs.writeText(target, content, undefined, undefined, freshPolicy(st))
+      const outcome = await fs.writeText(target, content, guard, undefined, freshPolicy(st))
       return outcome
     }
-    async function deleteFile(st, rel) {
+    // Guard token for "replace exactly what we last observed". An entry with no
+    // version (absent, or already gone) gets createIfAbsent instead: restoring a
+    // file the agent deleted must still work, while a target that reappeared
+    // under us is refused.
+    function guardOf(entry) {
+      if (entry && entry.present && entry.version !== null && entry.version !== undefined) {
+        return { kind: 'replaceIfVersion', version: entry.version }
+      }
+      return { kind: 'createIfAbsent' }
+    }
+    function isStaleWrite(e) {
+      const code = e && e.code ? String(e.code) : ''
+      if (code === 'FS_STALE_VERSION' || code === 'FS_NOT_OBSERVED') return true
+      const msg = e && e.message ? String(e.message) : String(e)
+      return /changed since it was read|no longer exists|without reading it first/.test(msg)
+    }
+    function staleWriteError() {
+      const e = new Error('文件已变化，请刷新后重试')
+      e.code = 'FS_STALE_VERSION'
+      return e
+    }
+    async function deleteFile(st, rel, info) {
       if (!shell) throw new Error('shell 服务不可用，无法删除文件')
       const target = await fs.resolve(joinPath(st.root, rel))
       const p = fs.processPath(target)
       const isWin = process.platform === 'win32'
       const bashQuote = (s) => "'" + String(s).replace(/'/g, "'\\''") + "'"
       const psQuote = (s) => "'" + String(s).replace(/'/g, "''") + "'"
-      // The shell executor on Windows is PowerShell (pwsh-local/sandbox): the
-      // bash idiom `rm -f -- path` fails there ("-f is ambiguous"). Pick the
-      // dialect by platform and fall back to the other one once.
-      const primary = isWin
-        ? 'Remove-Item -LiteralPath ' + psQuote(p) + ' -Force'
-        : 'rm -f -- ' + bashQuote(p)
-      const alternate = isWin
-        ? 'rm -f -- ' + bashQuote(p)
-        : 'Remove-Item -LiteralPath ' + psQuote(p) + ' -Force'
+      const isDir = !!(info && info.type === 'directory')
+      // v1.33 (F4): ONE dialect, chosen by platform, and NO cross-dialect
+      // fallback. The removed fallback ran a bash-quoted rm command through
+      // PowerShell whenever the PowerShell command failed. bash's quote escape
+      // is not PowerShell syntax: it closes the quote early, so an apostrophe in
+      // a path let any semicolon after it become a statement separator —
+      // arbitrary command execution from a single reject click (reproduced with
+      // a non-empty directory whose name carried a quote plus a payload, where
+      // the primary Remove-Item fails on the not-empty directory and the
+      // alternate ran the payload). PowerShell quoting is doubled for pwsh,
+      // backslash-escaped for bash, and each dialect stays in its own command.
+      const command = isWin
+        ? 'Remove-Item -LiteralPath ' + psQuote(p) + ' -Force' + (isDir ? ' -Recurse' : '')
+        : 'rm -f' + (isDir ? ' -r' : '') + ' -- ' + bashQuote(p)
       // v1.13.1: same null-policy hazard as writeFile — resolve fresh.
       const policy = freshPolicy(st)
       let result
       try {
-        result = await shell.run(shell.resolve({ command: primary, sandboxPolicy: policy }))
+        result = await shell.run(shell.resolve({ command: command, sandboxPolicy: policy }))
       } catch (e) {
         result = undefined
-      }
-      if (!result || result.exitCode !== 0) {
-        try {
-          result = await shell.run(shell.resolve({ command: alternate, sandboxPolicy: policy }))
-        } catch (e) {
-          result = undefined
-        }
       }
       if (!result || result.exitCode !== 0) {
         const stderr = result && result.stderr && result.stderr.text !== undefined ? String(result.stderr.text) : String((result && result.stderr) || '')
@@ -2273,11 +2932,92 @@ export default {
         const bytes = await fs.readBytes(target, undefined, MAX_BACKUP_BYTES)
         const dir = join(undoRoot(st.sid), rec.opId, ...segs.slice(0, -1))
         mkdirSync(dir, { recursive: true })
-        writeFileSync(join(dir, segs[segs.length - 1]), bytes)
+        // v1.34 (F5): a truncated undo backup would be restored verbatim by
+        // 撤销, so the backup is published atomically too.
+        writeBytesAtomicSync(join(dir, segs[segs.length - 1]), bytes)
         return { path: path, afterVersion: null }
       } catch (e) {
         return null
       }
+    }
+    // v1.33 (F1): "reject an added file" means DELETE it, which is only sound
+    // when the plugin can prove the file did not exist before the agent touched
+    // it. An ABSENT baseline is not that proof: the review map has no entry for
+    // every path the scan never reached (SKIP_DIRS, deeper than MAX_DEPTH, past
+    // the MAX_ENTRIES budget) nor for a file that appeared after the last scan,
+    // and attributing those to "the agent created it" made one reject click
+    // delete a file the user had owned all along (reproduced for both the
+    // skipped-directory and the user-created-then-agent-edited cases). The only
+    // positive proof is the write tool's own outcome (operation: 'create',
+    // recorded by the tools/result hook); everything else refuses instead of
+    // destroying data it cannot restore.
+    function assertDeletable(st, path, info) {
+      if (info && info.type && info.type !== 'file') {
+        throw new Error('无法删除：' + path + ' 不是普通文件，拒绝不会删除它')
+      }
+      if (!st.created.has(path)) {
+        throw new Error('无法证明「' + path + '」是 AI 新建的文件（它不在本次审查的基线快照中），为避免误删，拒绝不会删除它。可先点 ✓ 接受该文件，或手动删除。')
+      }
+    }
+    // v1.34 (F5): raw-byte writes cannot use fs.writeText (their payload is not
+    // UTF-8 text), and the two that write USER files used to bypass BOTH the
+    // sandbox fence and the temp+rename publish every other write goes through:
+    // under read-only / workspace-write they still rewrote files, and a crash
+    // mid-write could leave a truncated source file where a complete one was
+    // (the failure mode DEV.md 6.20 records for the state file).
+    function writeBytesAtomicSync(absPath, data) {
+      const dir = dirname(absPath)
+      const tmp = join(dir, '.' + absPath.slice(dir.length + 1) + '.' + process.pid + '.dshfe-tmp')
+      // v1.32.7 (F5 fix): the fs backend passes the target's CURRENT mode into
+      // its atomic write (fs-local: writeFileAtomic(..., existing?.mode, ...)),
+      // so a byte restore must not silently re-create the file with the process
+      // default — a 0755 script came back 0644 on POSIX. rename() replaces the
+      // inode, so the mode has to be applied to the temp file before publishing.
+      let mode = null
+      try { mode = statSync(absPath).mode } catch (e) { mode = null }
+      try {
+        writeFileSync(tmp, data)
+        if (mode !== null) { try { chmodSync(tmp, mode & 0o777) } catch (e) {} }
+        renameSync(tmp, absPath)
+      } catch (e) {
+        try { rmSync(tmp, { force: true }) } catch (e2) {}
+        throw e
+      }
+    }
+    // The same policy fence fs-sandbox applies to writeText, mirrored for the
+    // byte paths: read-only denies; workspace-write requires the canonical
+    // target under writableRoots(policy) — the workspace root, /tmp, os.tmpdir()
+    // (dsh-sandbox derives exactly that allow-list; imported here is not
+    // possible, so the rule is restated, not reinvented).
+    async function assertWritableTarget(st, target) {
+      const policy = freshPolicy(st)
+      // v1.32.7 (F5 fix): a policy without a mode used to mean "no fence at all"
+      // (fail-open). The deployment default is the mode the fs sandbox itself
+      // falls back to, and read-only is the fail-safe of last resort.
+      const mode = (policy && policy.mode) || (sandboxPolicy && sandboxPolicy.defaultMode) || 'read-only'
+      if (mode === 'danger-full-access') return target
+      if (mode === 'read-only') throw new Error('文件访问被拒绝：read-only 模式不允许写入 [FS_SANDBOX_DENIED]')
+      // Re-canonicalize NOW and hand the fresh target back to the caller, which
+      // writes to THAT one: the fs sandbox does the same in checkedTarget, so a
+      // symlink ancestor swapped between resolve and the mutation cannot slip
+      // through the check-here-write-there window.
+      const fresh = await fs.resolve(fs.processPath(target))
+      const roots = []
+      const seen = new Set()
+      for (const p of [policy.workspaceRoot, '/tmp', tmpdir()]) {
+        if (typeof p !== 'string' || p === '') continue
+        let key = p
+        try { key = (await fs.resolve(p)).targetKey } catch (e) { key = p }
+        if (seen.has(key)) continue
+        seen.add(key)
+        roots.push(key)
+      }
+      for (const root of roots) {
+        let under = false
+        try { under = fs.contains({ targetKey: root, displayPath: root }, fresh) } catch (e) { under = false }
+        if (under) return fresh
+      }
+      throw new Error('文件访问被拒绝：workspace-write 模式下目标不在可写根目录内 [FS_SANDBOX_DENIED]')
     }
     async function doReject(st, f, path, rec) {
       if (!f.base || !f.base.present) {
@@ -2294,8 +3034,13 @@ export default {
           f.justRejected = true
           return
         }
+        // v1.33 (F1): refuse unless the agent provably created it, and never
+        // delete through a path whose on-disk state already moved on.
+        assertDeletable(st, path, info)
+        if (f.cur && f.cur.present && f.cur.version !== info.version) throw staleWriteError()
         const snap = rec ? await snapshotForUndo(st, path, rec) : null
-        await deleteFile(st, path)
+        await deleteFile(st, path, info)
+        st.created.delete(path)
         f.cur = goneEntry()
         if (snap) { snap.afterVersion = null; rec.files.push(snap) }
       } else if (f.base.content === null && f.base.baselineRef) {
@@ -2307,11 +3052,16 @@ export default {
         const blobPath = join(blobRoot(st.sid), f.base.baselineRef)
         if (!existsSync(blobPath)) throw new Error('无法还原：大文件基线快照已丢失')
         const snap = rec ? await snapshotForUndo(st, path, rec) : null
-        const target = await fs.resolve(joinPath(st.root, path))
-        const live = f.base.crlf ? readFileSync(blobPath, 'utf8').split('\n').join('\r\n') : readFileSync(blobPath, 'utf8')
-        const outcome = await writeFile(st, path, live)
+        // The blob is LF-normalized, so the STORED style is what restores the
+        // bytes: the boolean crlf for a uniform file (v1.13.1) and the per-line
+        // map for a mixed one (v1.33/F6).
+        const blobText = readFileSync(blobPath, 'utf8')
+        const live = f.base.eolMap
+          ? joinLines(splitLines(blobText), f.base.eol, f.base.crlf, f.base.eolMap)
+          : (f.base.crlf ? blobText.split('\n').join('\r\n') : blobText)
+        const outcome = await writeFile(st, path, live, guardOf(f.cur))
         const restoredEntry = {
-          present: true, content: null, eol: f.base.eol, crlf: f.base.crlf === true,
+          present: true, content: null, eol: f.base.eol, crlf: f.base.crlf === true, eolMap: f.base.eolMap ?? null,
           version: outcome.version, size: outcome.size !== undefined ? outcome.size : Buffer.byteLength(live, 'utf8'),
           sig: f.base.sig ? { tier: f.base.sig.tier, n: f.base.sig.n, h: f.base.sig.h } : null,
           baselineRef: f.base.baselineRef, baselineBytes: f.base.baselineBytes ?? 0,
@@ -2328,11 +3078,23 @@ export default {
         // baseline time (binaries up to MAX_BACKUP_BYTES only).
         const blobPath = f.base.binRef ? join(blobRoot(st.sid), f.base.binRef) : null
         if (!blobPath || !existsSync(blobPath)) throw new Error('无法还原：文件过大或非文本')
-        const snap = rec ? await snapshotForUndo(st, path, rec) : null
         const target = await fs.resolve(joinPath(st.root, path))
-        writeFileSync(fs.processPath(target), readFileSync(blobPath))
-        const info = await fs.stat(target)
-        f.cur = { present: true, content: null, eol: false, crlf: false, version: info.version, size: info.size, note: 'binary', binRef: f.base.binRef, binSize: f.base.binSize }
+        // v1.33 (F3): this branch has no fs.writeText path (it restores raw
+        // bytes), so it re-checks the reviewed version itself before writing.
+        const liveInfo = await fs.stat(target)
+        if (f.cur && f.cur.present) {
+          if (!liveInfo || liveInfo.version !== f.cur.version) throw staleWriteError()
+        } else if (liveInfo) {
+          throw staleWriteError()
+        }
+        // v1.34 (F5): fence the byte restore and publish it atomically.
+        // v1.32.7: the fence returns the freshly canonicalized target, and THAT
+        // is what gets written (and re-stat'ed below).
+        const fresh = await assertWritableTarget(st, target)
+        const snap = rec ? await snapshotForUndo(st, path, rec) : null
+        writeBytesAtomicSync(fs.processPath(fresh), readFileSync(blobPath))
+        const info = await fs.stat(fresh)
+        f.cur = { present: true, content: null, eol: false, crlf: false, eolMap: null, version: info.version, size: info.size, note: 'binary', binRef: f.base.binRef, binSize: f.base.binSize }
         // Restored content IS the baseline again: align versions so
         // isChanged() reports no diff (binary has no content comparison).
         f.base = { ...cloneEntry(f.base), version: info.version, size: info.size }
@@ -2341,9 +3103,14 @@ export default {
         const snap = rec ? await snapshotForUndo(st, path, rec) : null
         // Write back with the ORIGINAL line endings: normalizing to LF here
         // used to rewrite CRLF files wholesale (one giant spurious diff).
-        const writeContent = f.base.crlf ? f.base.content.split('\n').join('\r\n') : f.base.content
-        const outcome = await writeFile(st, path, writeContent)
-        f.cur = { present: true, content: f.base.content, eol: f.base.eol, crlf: f.base.crlf, version: outcome.version, size: outcome.size !== undefined ? outcome.size : writeContent.length, binRef: null, binSize: 0 }
+        // v1.33 (F6): a MIXED file is rebuilt through its per-line map instead,
+        // so the lines the agent never touched keep the ending they had on disk.
+        const baseLines = splitLines(f.base.content)
+        const writeContent = f.base.eolMap && f.base.eolMap.length === baseLines.length
+          ? joinLines(baseLines, f.base.eol, f.base.crlf, f.base.eolMap)
+          : (f.base.crlf ? f.base.content.split('\n').join('\r\n') : f.base.content)
+        const outcome = await writeFile(st, path, writeContent, guardOf(f.cur))
+        f.cur = { present: true, content: f.base.content, eol: f.base.eol, crlf: f.base.crlf, eolMap: f.base.eolMap ?? null, version: outcome.version, size: outcome.size !== undefined ? outcome.size : writeContent.length, binRef: null, binSize: 0 }
         // Restored content IS the baseline: align versions so isChanged()
         // reports no diff (matters for large files where content comparison
         // is unavailable).
@@ -2406,7 +3173,7 @@ export default {
             const blobPath = join(blobRoot(st.sid), hash)
             if (!existsSync(blobPath)) {
               mkdirSync(blobRoot(st.sid), { recursive: true })
-              writeFileSync(blobPath, bytes)
+              writeBytesAtomicSync(blobPath, bytes)
             }
             f.cur.binRef = hash
             f.cur.binSize = bytes.length
@@ -2415,6 +3182,12 @@ export default {
       }
       f.base = cloneEntry(f.cur)
       armBaseline(st, path, f)
+      // v1.32.7 (F1 hygiene): accepting a created file makes its content the
+      // baseline, so the "the agent created this path" proof is spent. Leaving
+      // it behind would let a LATER entry for the same path that happens to have
+      // an absent baseline (user deletes and re-creates it, then the agent
+      // touches it) be deleted on the strength of a stale proof.
+      st.created.delete(path)
       f.decisions.clear()
       f.rev++
     }
@@ -2444,6 +3217,8 @@ export default {
           return tree
         }
         if (rootOverride) {
+          const gate = await allowRootOverride(ctx, sid, rootOverride, st.root)
+          if (!gate.ok) return gate
           try {
             const tree = await build(rootOverride)
             return { ok: true, root: rootOverride, tree: tree }
@@ -2478,6 +3253,11 @@ export default {
         const sid = String(args.sessionId)
         const rootOverride = args && args.root ? String(args.root) : null
         const rawPath = args && args.path !== undefined && args.path !== null ? String(args.path) : ''
+        if (rootOverride) {
+          // v1.34 (F7): the override needs a live session and a registered root.
+          const gate = await allowRootOverride(ctx, sid, rootOverride, st.root)
+          if (!gate.ok) return gate
+        }
         if (!rootOverride) {
           // Same freshness policy as listTree: the listing itself reflects
           // disk, the scan only keeps the REVIEW state current.
@@ -2516,7 +3296,7 @@ export default {
         // 20s failsafe cadence (ensureFresh).
         await ensureFresh(st, sid)
         if (st.error) return { ok: false, error: st.error }
-        return { ok: true, root: st.root, files: await modifiedFiles(st), treeStamp: st.treeStamp, undo: st.lastReject ? { opId: st.lastReject.opId, count: st.lastReject.files.length, ts: st.lastReject.ts } : null }
+        return { ok: true, root: st.root, files: await modifiedFiles(st), treeStamp: st.treeStamp, undo: st.lastReject ? { opId: st.lastReject.opId, count: st.lastReject.files.length, ts: st.lastReject.ts, kept: st.lastReject.kept === true } : null }
       },
 
       // Long-poll wake-up: resolves as soon as an agent mutation (write/edit/
@@ -2595,6 +3375,14 @@ export default {
             const parts = rel.split(/[\\/]/)
             if (parts.length !== 2 || parts[1] !== enc || parts[0] === '' || parts[0] === '.' || parts[0] === '..') continue
             if (!existsSync(dir)) continue
+            // v1.34 (F5 family): rmSync is a direct, unfenced call, so the TEXT
+            // check above is not enough — a symlinked or junctioned bucket
+            // directory would let it delete outside the sessions root. Re-check
+            // the shape on the REALPATH before removing anything.
+            const realRoot = (() => { try { return realpathSync(SESSIONS_ROOT) } catch (e) { return SESSIONS_ROOT } })()
+            const realDir = (() => { try { return realpathSync(dir) } catch (e) { return dir } })()
+            const realParts = relative(realRoot, realDir).split(/[\\/]/)
+            if (realParts.length !== 2 || realParts[1] !== enc || realParts[0] === '' || realParts[0] === '.' || realParts[0] === '..') continue
             try {
               rmSync(dir, { recursive: true, force: true })
               deleted++
@@ -2619,10 +3407,14 @@ export default {
         const st = requireState(args)
         if (!st) return { ok: false, error: 'no-session' }
         const sid = String(args.sessionId)
-        const path = args && args.path ? String(args.path) : ''
         // v1.18: resolve pending mutations precisely (targeted refresh) or by
         // the full-walk fallback; the 20s failsafe walk runs in the background.
         await ensureFresh(st, sid)
+        // v1.34 (F2): the client path is validated against the workspace root
+        // BEFORE it can address anything (getDiff registers entries on demand, so
+        // the read side needs it too). ensureFresh above has resolved st.root.
+        const path = relPathArg(st, args)
+        if (path === null) return badPath()
         // Single-file freshness check for the OPEN file: one cheap stat that
         // keeps the viewer current even when the mutation targeted another
         // file or came from outside the agent channel (v1.8 fold semantics).
@@ -2640,7 +3432,10 @@ export default {
               // pure CRLF/LF flip) leaves the entry — and therefore `changed`,
               // rev and the client's cached payload — exactly as it was.
               if (entrySame(f.cur, next)) {
-                // keep f.cur as-is
+                // v1.32.7: same content, moved identity — carry the NEW token
+                // onto the entry (adoptIdentity), or every later write to this
+                // file is refused as stale with no way to recover.
+                adoptIdentity(f.cur, next)
               } else {
                 if (f.decisions.size > 0) { f.decisions.clear(); f.rev++ }
                 f.cur = next
@@ -2652,6 +3447,8 @@ export default {
                 if (!pending && !st.touched.has(path) && st.shellWindow !== true && f.cur.present) {
                   f.base = cloneEntry(f.cur)
                   armBaseline(st, path, f)
+                  // v1.32.7 (F1 hygiene): a real baseline now exists for this path.
+                  st.created.delete(path)
                   f.decisions.clear()
                   f.rev++
                 }
@@ -2714,6 +3511,7 @@ export default {
               f.cur.content = text.replace(/\r\n/g, '\n')
               f.cur.crlf = /\r\n/.test(text)
               f.cur.eol = text.endsWith('\n')
+              f.cur.eolMap = eolMapOf(text)
               f.rev++
             }
           } catch (e) {}
@@ -2736,10 +3534,14 @@ export default {
         const st = requireState(args)
         if (!st) return { ok: false, error: 'no-session' }
         const sid = String(args.sessionId)
-        const path = args && args.path ? String(args.path) : ''
         const hunkId = args && args.hunkId ? String(args.hunkId) : ''
         const action = args && args.action === 'reject' ? 'reject' : 'accept'
         await ensureFresh(st, sid, { failsafe: false })
+        // v1.34 (F2): the client path is validated against the workspace root
+        // BEFORE it can address anything (getDiff registers entries on demand, so
+        // the read side needs it too). ensureFresh above has resolved st.root.
+        const path = relPathArg(st, args)
+        if (path === null) return badPath()
         const f = st.files.get(path)
         if (!f || !f.cur) return { ok: false, code: 'not-found', message: '文件不存在' }
         if (f.rev !== Number(args.rev)) return { ok: false, code: 'stale', message: '文件已变化，请刷新后重试' }
@@ -2753,16 +3555,52 @@ export default {
         if (action === 'reject') {
           const rec = newUndoRec()
           if (!f.base || !f.base.present) {
+            // v1.33 (F1): the same proof requirement as doReject — this branch
+            // deletes the whole file, and an absent baseline alone does not mean
+            // the agent created it.
+            let info
+            try { info = await fs.stat(await fs.resolve(joinPath(st.root, path))) } catch (e) { info = undefined }
+            if (!info) {
+              f.base = cloneEntry(f.cur)
+              armBaseline(st, path, f)
+              f.decisions.clear()
+              f.rev++
+              f.justRejected = true
+              return await diffPayload(f, st.root, path)
+            }
+            assertDeletable(st, path, info)
+            if (f.cur && f.cur.present && f.cur.version !== info.version) {
+              f.decisions.delete(hunkId)
+              return { ok: false, code: 'stale', message: '文件已变化，请刷新后重试' }
+            }
             const snap = await snapshotForUndo(st, path, rec)
-            await deleteFile(st, path)
+            await deleteFile(st, path, info)
+            st.created.delete(path)
             f.cur = goneEntry()
             if (snap) { snap.afterVersion = null; rec.files.push(snap) }
           } else {
             const snap = await snapshotForUndo(st, path, rec)
             const merged = mergeHunks(baseLines, all, f.decisions)
-            const text = joinLines(merged, f.base.eol, f.base.crlf)
-            const outcome = await writeFile(st, path, text)
-            f.cur = { present: true, content: text.replace(/\r\n/g, '\n'), eol: f.base.eol, crlf: f.base.crlf, version: outcome.version, size: outcome.size !== undefined ? outcome.size : text.length, binRef: null, binSize: 0 }
+            // v1.33 (F6): the terminator map follows the same splice, so a
+            // rejected hunk of a mixed-EOL file does not rewrite the endings of
+            // the lines it kept.
+            const mergedMap = f.base.eolMap && f.base.eolMap.length === baseLines.length
+              ? mergeEolMap(f.base.eolMap, all, f.decisions, f.base.eol, f.base.crlf)
+              : null
+            const text = joinLines(merged, f.base.eol, f.base.crlf, mergedMap)
+            let outcome
+            try {
+              // v1.33 (F3): the merge is built from in-memory content, so it must
+              // only land on the exact version it was computed from.
+              outcome = await writeFile(st, path, text, guardOf(f.cur))
+            } catch (e) {
+              // The decision was already recorded; undo it so the in-memory state
+              // still describes the file that is actually on disk.
+              f.decisions.delete(hunkId)
+              if (isStaleWrite(e)) return { ok: false, code: 'stale', message: '文件已变化，请刷新后重试', payload: await diffPayload(f, st.root, path) }
+              throw e
+            }
+            f.cur = { present: true, content: text.replace(/\r\n/g, '\n'), eol: f.base.eol, crlf: f.base.crlf, eolMap: mergedMap, version: outcome.version, size: outcome.size !== undefined ? outcome.size : text.length, binRef: null, binSize: 0 }
             if (snap) { snap.afterVersion = outcome.version; rec.files.push(snap) }
           }
           commitUndo(st, rec)
@@ -2797,11 +3635,20 @@ export default {
         const st = requireState(args)
         if (!st) return { ok: false, error: 'no-session' }
         const sid = String(args.sessionId)
-        const path = args && args.path ? String(args.path) : ''
         const idx = Number(args.idx)
-        const text = args && typeof args.text === 'string' ? args.text.replace(/\r/g, '') : ''
+        // v1.33 (F6): the line text is written back VERBATIM. The old blanket
+        // CR strip deleted every lone CR the file contained (a Mac-classic file
+        // collapsed into a single line after one keystroke) — a byte the user
+        // never touched. The client's line model is LF-normalized already; a
+        // stray CR here IS content.
+        const text = args && typeof args.text === 'string' ? args.text : ''
         if (!Number.isInteger(idx) || idx < 0) return { ok: false, code: 'stale', message: '编辑位置无效' }
         await ensureFresh(st, sid, { failsafe: false })
+        // v1.34 (F2): the client path is validated against the workspace root
+        // BEFORE it can address anything (getDiff registers entries on demand, so
+        // the read side needs it too). ensureFresh above has resolved st.root.
+        const path = relPathArg(st, args)
+        if (path === null) return badPath()
         const f = st.files.get(path)
         if (!f || !f.cur || !f.cur.present) return { ok: false, code: 'not-found', message: '文件不存在' }
         if (f.rev !== Number(args.rev)) return { ok: false, code: 'stale', message: '文件已变化，请刷新后重试' }
@@ -2822,6 +3669,16 @@ export default {
         const nextCur = curLines.slice()
         if (idx === curLines.length) nextCur.push(text)
         else nextCur[idx] = text
+        // v1.33 (F6): the terminator map follows the same single-line splice, so
+        // the untouched lines keep the ending they had on disk. Only an APPEND
+        // changes the map: the previously last line gains a terminator and the
+        // new last line takes the file's trailing-newline state.
+        let nextMap = f.cur.eolMap && f.cur.eolMap.length === curLines.length ? f.cur.eolMap : null
+        if (nextMap) {
+          const dom = dominantEolChar(nextMap, f.cur.crlf)
+          if (idx === curLines.length) nextMap = nextMap.slice(0, nextMap.length - 1) + dom + (f.cur.eol ? dom : 'n')
+        }
+        if (nextMap && nextMap.length !== nextCur.length) nextMap = null
         if (!container && f.base && f.base.present) {
           // Context line: fold the identical edit into the baseline at the
           // aligned index. Alignment shift = sum of (newLen - oldLen) over
@@ -2831,7 +3688,10 @@ export default {
           const baseIdx = idx - shift
           if (baseIdx >= 0 && baseIdx <= baseLines.length) {
             baseLines.splice(baseIdx, baseIdx < baseLines.length ? 1 : 0, text)
-            f.base = { ...cloneEntry(f.base), content: joinLines(baseLines, f.base.eol) }
+            // The folded baseline keeps its EOL map only while the two stay
+            // index-aligned; otherwise the legacy uniform style is used.
+            const foldedMap = f.base.eolMap && f.base.eolMap.length === baseLines.length ? f.base.eolMap : null
+            f.base = { ...cloneEntry(f.base), content: joinLines(baseLines, f.base.eol), eolMap: foldedMap }
           }
         }
         // container !== null: the line belongs to a hunk (pending added line,
@@ -2842,14 +3702,18 @@ export default {
         // decisions rather than misapplying them to reshaped hunks.
         const shapeOf = (h) => h.oldStart + ':' + h.oldLen + ':' + h.newStart + ':' + h.newLen
         if (all.map(shapeOf).join('|') !== newAll.map(shapeOf).join('|')) f.decisions.clear()
-        const textOut = joinLines(nextCur, f.cur.eol, f.cur.crlf)
+        const textOut = joinLines(nextCur, f.cur.eol, f.cur.crlf, nextMap)
         let outcome
         try {
-          outcome = await writeFile(st, path, textOut)
+          // v1.33 (F3): the whole file is rebuilt from in-memory content, so it
+          // may only replace the exact version that content came from — an
+          // unobserved external edit is reported as stale instead of vanishing.
+          outcome = await writeFile(st, path, textOut, guardOf(f.cur))
         } catch (e) {
+          if (isStaleWrite(e)) return { ok: false, code: 'stale', message: '文件已变化，请刷新后重试', payload: await diffPayload(f, st.root, path) }
           return { ok: false, error: e && e.message ? String(e.message) : String(e) }
         }
-        f.cur = { present: true, content: textOut.replace(/\r\n/g, '\n'), eol: f.cur.eol, crlf: f.cur.crlf, version: outcome.version, size: outcome.size !== undefined ? outcome.size : textOut.length }
+        f.cur = { present: true, content: textOut.replace(/\r\n/g, '\n'), eol: f.cur.eol, crlf: f.cur.crlf, eolMap: nextMap, version: outcome.version, size: outcome.size !== undefined ? outcome.size : textOut.length }
         // changed-flag hygiene: with no pending hunks the file IS the
         // baseline now — align versions so the toolbar hides.
         const newPending = newAll.filter((h) => !f.decisions.has(h.id))
@@ -2882,11 +3746,18 @@ export default {
         const st = requireState(args)
         if (!st) return { ok: false, error: 'no-session' }
         const sid = String(args.sessionId)
-        const path = args && args.path ? String(args.path) : ''
         const rawLines = Array.isArray(args.lines) ? args.lines : null
         if (!rawLines) return { ok: false, code: 'bad', message: '无效的保存内容' }
-        const lines = rawLines.map((s) => String(s).replace(/\r/g, ''))
+        // v1.33 (F6): verbatim, same reasoning as applyEdit — a lone CR in the
+        // line text is FILE CONTENT (a Mac-classic line break), not noise to be
+        // deleted behind the user's back.
+        const lines = rawLines.map((s) => String(s))
         await ensureFresh(st, sid, { failsafe: false })
+        // v1.34 (F2): the client path is validated against the workspace root
+        // BEFORE it can address anything (getDiff registers entries on demand, so
+        // the read side needs it too). ensureFresh above has resolved st.root.
+        const path = relPathArg(st, args)
+        if (path === null) return badPath()
         if (st.baseReady) {
           // On-disk freshness check (mirrors getDiff's single-file refresh):
           // the editor may have been open across an agent edit the scan has
@@ -2906,6 +3777,11 @@ export default {
                   if (f0.decisions.size > 0) { f0.decisions.clear(); f0.rev++ }
                   f0.cur = next
                   f0.rev++
+                } else {
+                  // v1.32.7: identical content still means the stat identity may
+                  // have moved — adopt it so the guard below (and every later
+                  // write) compares against the real disk token.
+                  adoptIdentity(f0.cur, next)
                 }
               }
             } catch (e) {}
@@ -2947,6 +3823,10 @@ export default {
         const all = computeHunks(baseLines, curLines)
         const canFold = !!(f.base && f.base.present && f.base.content !== null)
         let newBase = canFold ? baseLines.slice() : null
+        // v1.33 (F6): the same op stream that folds this save into the baseline
+        // also carries the per-line EOL map onto the new content, so a mixed-EOL
+        // file keeps its endings on the lines the user did not touch.
+        let saveOps = null
         if (newBase) {
           // v1.22: the user's own save never enters the review — ops fold into
           // the baseline EVERYWHERE, including inside pending hunks. shiftAt
@@ -2957,6 +3837,7 @@ export default {
           for (const h of all) shiftAt[h.newStart] += h.newLen - h.oldLen
           for (let i = 1; i < shiftAt.length; i++) shiftAt[i] += shiftAt[i - 1]
           const ops = myersOps(curLines, lines)
+          saveOps = ops
           const ctxDel = []
           const ctxIns = []
           let insBefore = 0
@@ -3011,15 +3892,28 @@ export default {
             }
           }
         }
-        const textOut = joinLines(lines, f.cur.eol, f.cur.crlf)
+        const saveMap = f.cur.eolMap && f.cur.eolMap.length === curLines.length
+          ? remapEolMap(f.cur.eolMap, saveOps, lines.length, f.cur.eol, f.cur.crlf)
+          : null
+        const textOut = joinLines(lines, f.cur.eol, f.cur.crlf, saveMap)
         let outcome
         try {
-          outcome = await writeFile(st, path, textOut)
+          // v1.33 (F3): a whole-content save replaces the file, so it must land
+          // on the exact version it was built from (the same guard applyEdit and
+          // the reject paths use).
+          outcome = await writeFile(st, path, textOut, guardOf(f.cur))
         } catch (e) {
+          if (isStaleWrite(e)) return { ok: false, code: 'stale', message: '文件已变化，请刷新后重试', payload: await diffPayload(f, st.root, path) }
           return { ok: false, error: e && e.message ? String(e.message) : String(e) }
         }
-        f.cur = { present: true, content: joinLines(lines, f.cur.eol), eol: f.cur.eol, crlf: f.cur.crlf, version: outcome.version, size: outcome.size !== undefined ? outcome.size : textOut.length, binRef: null, binSize: 0, md: f.cur.md === true }
-        if (newBase !== null) f.base = { ...cloneEntry(f.base), content: joinLines(newBase, f.base.eol) }
+        f.cur = { present: true, content: joinLines(lines, f.cur.eol), eol: f.cur.eol, crlf: f.cur.crlf, eolMap: saveMap, version: outcome.version, size: outcome.size !== undefined ? outcome.size : textOut.length, binRef: null, binSize: 0, md: f.cur.md === true }
+        if (newBase !== null) {
+          // The folded baseline keeps its own map only while it still lines up
+          // with the folded base array (the fold uses shifted base indices, so
+          // anything else falls back to the uniform style).
+          const baseMap = f.base.eolMap && f.base.eolMap.length === newBase.length ? f.base.eolMap : null
+          f.base = { ...cloneEntry(f.base), content: joinLines(newBase, f.base.eol), eolMap: baseMap }
+        }
         // Hunk topology changed (merged/split/vanished) → drop stale decisions
         // instead of misapplying them to reshaped hunks (v1.3 rule).
         const newAll = computeHunks(newBase !== null ? newBase : baseLines, lines)
@@ -3045,10 +3939,14 @@ export default {
         const st = requireState(args)
         if (!st) return { ok: false, error: 'no-session' }
         const sid = String(args.sessionId)
-        const path = args && args.path ? String(args.path) : ''
         // v1.18: no unconditional walk — accept only needs the review state
         // fresh (first scan / dirty), not a disk re-sync or the 20s failsafe.
         await ensureFresh(st, sid, { failsafe: false })
+        // v1.34 (F2): the client path is validated against the workspace root
+        // BEFORE it can address anything (getDiff registers entries on demand, so
+        // the read side needs it too). ensureFresh above has resolved st.root.
+        const path = relPathArg(st, args)
+        if (path === null) return badPath()
         const f = st.files.get(path)
         if (!f || !f.cur) return { ok: false, code: 'not-found', message: '文件不存在' }
         await doAccept(st, f, path)
@@ -3060,12 +3958,17 @@ export default {
         const st = requireState(args)
         if (!st) return { ok: false, error: 'no-session' }
         const sid = String(args.sessionId)
-        const path = args && args.path ? String(args.path) : ''
         await ensureFresh(st, sid, { failsafe: false })
+        // v1.34 (F2): the client path is validated against the workspace root
+        // BEFORE it can address anything (getDiff registers entries on demand, so
+        // the read side needs it too). ensureFresh above has resolved st.root.
+        const path = relPathArg(st, args)
+        if (path === null) return badPath()
         const f = st.files.get(path)
         if (!f || !f.cur) return { ok: false, code: 'not-found', message: '文件不存在' }
+        let rec = null
         try {
-          const rec = newUndoRec()
+          rec = newUndoRec()
           await doReject(st, f, path, rec)
           commitUndo(st, rec)
           // v1.18: reject is destructive (disk rewritten + undo record) —
@@ -3073,6 +3976,10 @@ export default {
           scheduleSave(st, true)
           return { ok: true }
         } catch (e) {
+          // A refused or stale reject wrote nothing: drop the pre-reject backup
+          // this attempt had already taken so it cannot outlive the operation.
+          if (rec) { try { rmSync(join(undoRoot(st.sid), rec.opId), { recursive: true, force: true }) } catch (e2) {} }
+          if (isStaleWrite(e)) return { ok: false, code: 'stale', message: '文件已变化，请刷新后重试', payload: await diffPayload(f, st.root, path) }
           return { ok: false, error: e && e.message ? String(e.message) : String(e) }
         }
       },
@@ -3133,6 +4040,7 @@ export default {
         if (!rec) return { ok: false, code: 'no-undo', message: '没有可撤销的拒绝操作' }
         const restored = []
         const skipped = []
+        let fenceDenied = false
         for (const item of rec.files) {
           const segs = item.path.split('/')
           if (segs.some(function (s) { return s === '..' || s === '.' || s === '' })) {
@@ -3154,7 +4062,10 @@ export default {
           }
           try {
             const bytes = readFileSync(src)
-            writeFileSync(fs.processPath(target), bytes)
+            // v1.34 (F5): same fence + atomic publish as the reject path.
+            // v1.32.7: the fence's freshly canonicalized target is the one written.
+            const fresh = await assertWritableTarget(st, target)
+            writeBytesAtomicSync(fs.processPath(fresh), bytes)
             restored.push(item.path)
             let f = st.files.get(item.path)
             if (!f) {
@@ -3173,8 +4084,24 @@ export default {
             st.dirty = true
             st.pendingTargets = null
           } catch (e) {
-            skipped.push({ path: item.path, reason: e && e.message ? String(e.message) : String(e) })
+            const msg = e && e.message ? String(e.message) : String(e)
+            // v1.32.7 (F5 fix): a sandbox refusal is the ONE skip reason that is
+            // transient and environment-caused ("switch the mode and retry"), so
+            // it must not consume the record below.
+            if (msg.indexOf('FS_SANDBOX_DENIED') >= 0) fenceDenied = true
+            skipped.push({ path: item.path, reason: msg })
           }
+        }
+        // v1.32.7 (F5 fix): a fence refusal wrote NOTHING, so the undo record
+        // (the only copy of the pre-reject bytes) has to survive — consuming it
+        // turned "read-only denied the undo" into "the undo is gone forever".
+        // A skip caused by the file changing again IS a real state move and
+        // still ends the record, exactly as before.
+        if (restored.length === 0 && fenceDenied) {
+          // Mark the record so getModified can tell the client it is still
+          // actionable (the undo affordance is otherwise age-bounded).
+          rec.kept = true
+          return { ok: true, restored: restored, skipped: skipped, kept: true }
         }
         // v1.15.1: any restored file changed disk → reload the tree and drop
         // the cached git snapshot so the VCS badges re-ask git (undo-reject
@@ -3271,7 +4198,11 @@ export default {
         const sid = String(args.sessionId)
         const root = await ensureTermRoot(st, sid)
         if (!root) return { ok: false, error: 'no-workspace' }
-        const candidates = await detectRunCandidates(st, args && typeof args.path === 'string' ? args.path : '')
+        // v1.34 (F2): same validation as every other client path — an odd path
+        // here only steers which project the runner detection prefers, so it
+        // degrades to the workspace root instead of erroring.
+        const activePath = relPathArg(st, args) || ''
+        const candidates = await detectRunCandidates(st, activePath)
         return { ok: true, root: root, shell: TERM_SHELL.name, candidates: candidates }
       },
     }
@@ -3974,7 +4905,25 @@ export default {
       notifyTimers.clear()
       // v1.18: flush any debounced state saves so a stop/update cannot drop
       // the last accept/reject/scan changes.
-      for (const [, rec] of saveTimers) { clearTimeout(rec.t); saveState(rec.st) }
+      // v1.32.3: the flush must reach DISK before the fiber ends, so it always
+      // uses the synchronous path. That write also supersedes any queued async
+      // generation, whose temp file would otherwise be published AFTER this
+      // flush and resurrect the older state.
+      const flushSids = new Set()
+      for (const [sid, rec] of saveTimers) { clearTimeout(rec.t); flushSids.add(sid) }
+      for (const sid of saveChain.keys()) flushSids.add(sid)
+      for (const sid of abandonedSaves) flushSids.add(sid)
+      for (const [sid, s] of states) if (s.saveRun && s.saveRun.active) flushSids.add(sid)
+      for (const sid of flushSids) {
+        const s = states.get(sid)
+        if (!s) {
+          // A session whose state was already evicted: only its pending write
+          // needs to be dropped (there is nothing in memory left to flush).
+          abandonedSaves.add(sid)
+          continue
+        }
+        saveState(s, { force: true })
+      }
       saveTimers.clear()
       // v1.24: no terminal child may outlive the plugin fiber.
       for (const [, t] of terms) { if (t.pid) termKillTree(t.pid, 'SIGKILL') }
@@ -4043,8 +4992,22 @@ export default {
       if (name === 'write' || name === 'edit') {
         const raw = args && typeof args.file_path === 'string' ? args.file_path : ''
         const rel = normalizeRelPath(st.root, raw)
-        if (rel) { st.touched.add(rel); addTarget(st, rel); attributed = true }
-        else fallbackWindow(st)
+        if (rel) {
+          st.touched.add(rel)
+          // v1.33 (F1): the write tool reports the operation it performed, and
+          // 'create' is the ONLY positive proof that this path did not exist
+          // before the agent touched it. doReject consults this set before it
+          // deletes anything (see assertDeletable). The edit tool can never
+          // create a file, so it contributes nothing; a result without a usable
+          // value (blocked/errored call) proves nothing either — the safe
+          // direction is to refuse rather than to delete.
+          if (name === 'write' && result && result.isError === false
+              && result.value && result.value.operation === 'create') {
+            st.created.add(rel)
+          }
+          addTarget(st, rel)
+          attributed = true
+        } else fallbackWindow(st)
       } else {
         // shell / pwsh / git: extract precise targets from the command text.
         // Both extractors run (a command can mix `git ... ; Set-Content ...`):

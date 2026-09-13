@@ -1757,7 +1757,10 @@ window.__ModuleLoader__.load({
             return React.createElement('div', null,
               React.createElement('div', {
                 className: rowCls,
-                onClick: () => setOpen(!open),
+                // v1.32.4: closing a folder tells the owner to evict its cached
+                // level (see evictDir) — in lazy mode only, since the eager
+                // fallback has no per-level cache.
+                onClick: () => { if (open && lazy) props.onCloseDir(node.path); setOpen(!open) },
                 title: ignoredNote + (node.path || node.name),
               },
                 React.createElement('span', { className: 'dsh-fe-chev' }, canExpand ? IconChevron() : null),
@@ -1772,7 +1775,7 @@ window.__ModuleLoader__.load({
                   ? React.createElement('div', { className: 'dsh-fe-msg dsh-fe-dirmsg' }, '（空）') : null,
                 lazy && entry && entry.truncated
                   ? React.createElement('div', { className: 'dsh-fe-msg dsh-fe-dirmsg' }, '（目录过大，仅显示前 ' + (entry.limit || 4000) + ' 项）') : null,
-                kids.map((c) => React.createElement(TreeNode, { key: c.name, node: c, depth: depth + 1, onOpen: props.onOpen, lazy: lazy, cache: props.cache, onLoadDir: props.onLoadDir })),
+                kids.map((c) => React.createElement(TreeNode, { key: c.name, node: c, depth: depth + 1, onOpen: props.onOpen, lazy: lazy, cache: props.cache, onLoadDir: props.onLoadDir, onCloseDir: props.onCloseDir })),
               ) : null,
             )
           }
@@ -1831,6 +1834,19 @@ window.__ModuleLoader__.load({
           // re-render — same shape as the other transient caches in this file.
           const dirRef = React.useState(() => ({ mode: 'unknown', cache: new Map() }))[0]
           const [dirTick, setDirTick] = React.useState(0)
+          // v1.32.4: per-path generation counter for EVICTED levels. The cache
+          // used to keep a level alive after it was collapsed, so the 20s silent
+          // poll went on re-listing every folder the user had ever opened — a
+          // single wide folder (measured: ~470ms for 4000 entries, plus ~65ms of
+          // git) then cost that much on every 20s tick, forever, even after it
+          // was collapsed and even from another Session in the same Workspace.
+          // Dropping the cache entry is not enough on its own: fetchDir writes
+          // through putDir after its await, so an in-flight response would
+          // resurrect the entry and the poll would keep hitting it. A request
+          // therefore captures this counter before it is sent and discards its
+          // own late answer once the counter has moved (evicted, or superseded
+          // by the re-expand that followed).
+          const dirGen = React.useState(() => new Map())[0]
           const [query, setQuery] = React.useState('')
           // v1.19: whether the session-history overflow control has been
           // expanded (transient per-mount state, same as the shell's
@@ -1960,8 +1976,15 @@ window.__ModuleLoader__.load({
           const fetchDir = async (path, keep) => {
             const cur = dirRef.cache.get(path)
             if (cur && cur.loading) return
+            const gen = dirGen.get(path) || 0
             putDir(path, keep ? { loading: true } : { children: [], loaded: false, loading: true, error: null })
             const r = await call('listDir', { sessionId: sid, root: ws.path, path: path })
+            // v1.32.4: the level was evicted (collapsed) or superseded while this
+            // request was in flight — drop the answer instead of resurrecting a
+            // cache entry that would put the folder back on the 20s poll. This
+            // also fixes a pre-existing race where a stale response could land
+            // on top of the request the re-expand had already started.
+            if ((dirGen.get(path) || 0) !== gen) return
             if (r && r.ok) putDir(path, { children: r.children || [], loaded: true, loading: false, error: null, truncated: !!r.truncated, limit: Number(r.limit) || 0 })
             else putDir(path, { children: keep && cur ? cur.children : [], loaded: true, loading: false, error: (r && r.error) || '加载失败' })
           }
@@ -1972,6 +1995,19 @@ window.__ModuleLoader__.load({
             const cur = dirRef.cache.get(path)
             if (cur && (cur.loaded || cur.loading)) return
             void fetchDir(path, false)
+          }
+          // v1.32.4: collapsing a folder EVICTS its level, so it stops being
+          // polled and its next expand re-reads the directory. Only this one
+          // level needs dropping — collapsing unmounts the whole subtree, so no
+          // descendant row survives to be refreshed on its own, and B's own
+          // entry (A→B both open when A closed) is inert once nothing renders
+          // it. The generation bump is the part that makes the eviction hold
+          // against an in-flight response; see dirGen above.
+          const evictDir = (path) => {
+            if (!dirRef.cache.has(path) && !dirGen.has(path)) return
+            dirGen.set(path, (dirGen.get(path) || 0) + 1)
+            dirRef.cache.delete(path)
+            setDirTick((n) => n + 1)
           }
           // v1.15.1: `silent` reloads skip the '…' busy indicator — the 20s
           // background re-check below must not flash the refresh button.
@@ -2298,6 +2334,7 @@ window.__ModuleLoader__.load({
                     lazy: dirRef.mode !== 'eager',
                     cache: dirRef.cache,
                     onLoadDir: loadDir,
+                    onCloseDir: evictDir,
                   })) : null,
               ) : null,
             ) : null,
@@ -2537,18 +2574,24 @@ window.__ModuleLoader__.load({
             setError(null)
             const r = await call('undoReject', { sessionId: sid })
             if (!r.ok) setError(r.error || r.message || '撤销失败')
-            else if (r.skipped && r.skipped.length > 0) setError('部分文件未撤销：已被再次修改（' + r.skipped.length + ' 个）')
+            else if (r.skipped && r.skipped.length > 0) setError(r.kept ? '撤销被文件策略拒绝（' + r.skipped.length + ' 个），撤销记录已保留：切换文件策略后可直接重试' : '部分文件未撤销：已被再次修改（' + r.skipped.length + ' 个）')
             await refresh()
           }
           const actAll = async (method) => {
             if (!sid) return
             const r = await call(method, { sessionId: sid })
             if (!r.ok) setError(r.error || r.message || '操作失败')
+            // v1.33 (F1): a batch reject reports the files it REFUSED to touch
+            // (no proof the agent created them, or they changed on disk since
+            // the review last saw them) — the row list keeps them, so say so
+            // instead of skipping them silently. Same pattern as the
+            // undoReject skipped list above.
+            else if (r.failed && r.failed.length > 0) setError('有 ' + r.failed.length + ' 个文件未拒绝（无法证明是 AI 新建，或已被再次修改），已保留原文件')
             await refresh()
             store.requestRefresh()
           }
           const list = files || []
-          const undoFresh = undo && undo.opId !== dismissed && Date.now() - undo.ts < 30000
+          const undoFresh = undo && (undo.kept === true || (undo.opId !== dismissed && Date.now() - undo.ts < 30000))
           // The bar stays mounted while leaving rows animate out (rowSet may
           // still hold them when the logical list is already empty).
           const visible = !!(sid && (rowSet.length > 0 || undoFresh))
