@@ -4199,11 +4199,11 @@ export default {
         const root = await ensureTermRoot(st, sid)
         if (!root) return { ok: false, error: 'no-workspace' }
         // v1.34 (F2): same validation as every other client path — an odd path
-        // here only steers which project the runner detection prefers, so it
-        // degrades to the workspace root instead of erroring.
+        // here only steers which FILE the run button would run, so it
+        // degrades to "no file" (and a plain reason) instead of erroring.
         const activePath = relPathArg(st, args) || ''
-        const candidates = await detectRunCandidates(st, activePath)
-        return { ok: true, root: root, shell: TERM_SHELL.name, candidates: candidates }
+        const r = await detectRunTarget(st, activePath)
+        return { ok: true, root: root, shell: TERM_SHELL.name, path: activePath, candidates: r.candidates, reason: r.reason || null }
       },
     }
 
@@ -4492,23 +4492,55 @@ export default {
       return { ok: true, ...termInfoOf(t) }
     }
 
-    // ---------- v1.24: project run-target detection ----------
-    // Local environments win over global ones: `node_modules/.bin/<pm>`,
-    // `.venv/Scripts/python.exe`, `./gradlew`, `./mvnw` are preferred whenever
-    // they exist; the global command is the fallback. Detection is best-effort
-    // by design — an unknown project still gets the terminal's free-form input.
-    const RUN_SCRIPT_ORDER = ['dev', 'start', 'serve', 'preview', 'run', 'develop', 'watch']
-    const RUN_SCRIPT_SKIP = /^(test|tests|lint|format|typecheck|build|clean|prepare|prepublish|postinstall|preinstall|release|deploy|docs?)$/i
+    // ---------- v1.24: run-target detection ----------
+    // v1.32.9: the run button runs THE FILE THAT IS OPEN — nothing else.
+    //
+    // The previous detector scanned the project for an entry point (npm scripts,
+    // manage.py, Gradle/Maven/Cargo/Go/.NET/Make/PHP/Ruby/Compose, and the entry
+    // names main.py/app.py/run.py/… ) and ranked that ABOVE the active file.
+    // `activePath` was consulted only inside an `out.length === 0` fallback, so a
+    // project with any recognizable entry never reached it: opening `DEMO_UI.py`
+    // in ECR-filing-automation (which also has `run.py`) and pressing 运行
+    // executed `run.py`. Project-entry detection is gone by decision; what
+    // remains is the half the button genuinely needs — resolving the RUNNER for
+    // ONE file, with the project-local runtime (.venv, runtime/python/python.exe,
+    // a portable node, …) preferred over PATH.
     function termQuote(s) {
       if (TERM_SHELL.dialect === 'pwsh') return "'" + String(s).replace(/'/g, "''") + "'"
       return "'" + String(s).replace(/'/g, "'\\''") + "'"
     }
-    async function detectRunCandidates(st, activePath) {
+    // Extension → the runner that has to be resolved before the file can run.
+    const RUN_EXT_HINT = '.py / .js / .mjs / .cjs / .ts / .ps1 / .sh'
+    const RUN_KINDS = {
+      py: 'python',
+      js: 'node', mjs: 'node', cjs: 'node',
+      ts: 'tsx', mts: 'tsx', cts: 'tsx',
+      ps1: 'pwsh', sh: 'bash',
+    }
+    // A binary (or non-UTF-8) file that merely carries a script extension must not
+    // be "run". `fs.readText` refuses exactly that class (NUL byte / invalid UTF-8
+    // → FS_NOT_TEXT), so one read doubles as the check. Past this size the probe
+    // is skipped: a multi-megabyte script is still a script.
+    const RUN_PROBE_MAX_BYTES = 1024 * 1024
+
+    // Returns { candidates, reason }: ONE candidate when the open file can be
+    // run, otherwise none plus the sentence the client shows on its greyed button.
+    // Zero or one on purpose — with no project scanning there is no second target
+    // to choose between, which is why the picker is gone with it.
+    async function detectRunTarget(st, activePath) {
       const root = st.root
-      const out = []
-      const seen = new Set()
+      const none = (reason) => ({ candidates: [], reason: reason })
+      const rel = String(activePath || '').replace(/\\/g, '/').replace(/^\/+/, '')
+      if (rel.length === 0) return none('没有打开的文件')
+      if (isAbsolute(rel) || rel.split('/').indexOf('..') >= 0) return none('文件不在工作区内')
+      const segs = rel.split('/').filter((s) => s.length > 0)
+      const name = segs.length > 0 ? segs[segs.length - 1] : ''
+      const dot = name.lastIndexOf('.')
+      const ext = dot > 0 ? name.slice(dot + 1).toLowerCase() : ''
+      const kind = Object.prototype.hasOwnProperty.call(RUN_KINDS, ext) ? RUN_KINDS[ext] : null
+      if (!kind) return none('当前文件不是可运行的程序文件（' + RUN_EXT_HINT + '）')
       let rootTarget
-      try { rootTarget = await fs.resolve(root) } catch (e) { return out }
+      try { rootTarget = await fs.resolve(root) } catch (e) { return none('无法读取工作区') }
       let entries = []
       try { entries = await fs.listDir(rootTarget) } catch (e) { entries = [] }
       const files = new Set()
@@ -4516,20 +4548,22 @@ export default {
       for (const e of entries) { if (e.type === 'directory') dirs.add(e.name); else files.add(e.name) }
       const has = (n) => files.has(n)
       const hasDir = (n) => dirs.has(n)
-      const readRel = async (rel) => { try { return await fs.readText(await fs.resolve(joinPath(root, rel))) } catch (e) { return null } }
-      const existsRel = async (rel) => { try { return !!(await fs.stat(await fs.resolve(joinPath(root, rel)))) } catch (e) { return false } }
-      const firstExisting = async (rels) => { for (const rel of rels) if (await existsRel(rel)) return rel; return null }
-      const localExe = (rel) => (TERM_SHELL.dialect === 'pwsh' ? '& ' : '') + '"' + joinPath(root, rel) + '"'
-      const push = (c) => {
-        if (!c || !c.command) return
-        const key = c.command
-        if (seen.has(key)) return
-        seen.add(key)
-        out.push(c)
+      const existsRel = async (r2) => { try { return !!(await fs.stat(await fs.resolve(joinPath(root, r2)))) } catch (e) { return false } }
+      const firstExisting = async (rels) => { for (const r2 of rels) if (await existsRel(r2)) return r2; return null }
+      const localExe = (r2) => (TERM_SHELL.dialect === 'pwsh' ? '& ' : '') + '"' + joinPath(root, r2) + '"'
+      // The file itself is verified BEFORE any runner is resolved: a directory (or
+      // a special entry) named like a script must never become a target. This is
+      // the v1.32.8 lesson — "this name exists" is not "this is runnable".
+      const abs = joinPath(root, rel)
+      let info = null
+      try { info = await fs.stat(await fs.resolve(abs)) } catch (e) { info = null }
+      if (!info || info.type !== 'file') return none('文件不存在或不是普通文件')
+      if (info.size <= RUN_PROBE_MAX_BYTES) {
+        try { await fs.readText(await fs.resolve(abs)) } catch (e) { return none('二进制文件不可运行') }
       }
       // ---- project-local runtimes (v1.25) ----
       // "Local first" has to mean the RUNTIME, not just the script: a bare
-      // `python`/`node`/`cargo` is resolved by the child shell against PATH,
+      // `python`/`node`/`bash` is resolved by the child shell against PATH,
       // i.e. the host process's environment — the project folder is never
       // consulted. So every runtime this detector emits is looked up inside
       // the workspace first and, when found, invoked by absolute path.
@@ -4734,172 +4768,42 @@ export default {
       }
       const noteOf = (r) => (r.note ? '本地 ' + r.note : '全局 PATH')
 
-      // ---- Node / JavaScript / TypeScript ----
-      // A project-local node runtime (portable node, a node dropped in the
-      // root, a conda-style tools/ dir) wins over the PATH `node`.
-      const nodeRun = await resolveExe(exeNames('node'), 'node')
-      if (has('package.json')) {
-        let pkg = null
-        try { pkg = JSON.parse((await readRel('package.json')) || '{}') } catch (e) { pkg = null }
-        const scripts = pkg && pkg.scripts && typeof pkg.scripts === 'object' ? pkg.scripts : {}
-        const pm = has('pnpm-lock.yaml') ? 'pnpm' : has('yarn.lock') ? 'yarn' : (has('bun.lockb') || has('bun.lock')) ? 'bun' : 'npm'
-        const localPm = await firstExisting(['node_modules/.bin/' + pm + '.cmd', 'node_modules/.bin/' + pm + '.ps1', 'node_modules/.bin/' + pm])
-        const runner = localPm ? localExe(localPm) : pm
-        const pmSource = localPm ? 'local' : 'global'
-        const pmNote = localPm ? '本地 ' + localPm : '全局 PATH'
-        const names = Object.keys(scripts)
-        const ordered = RUN_SCRIPT_ORDER.filter((n) => names.indexOf(n) >= 0)
-          .concat(names.filter((n) => RUN_SCRIPT_ORDER.indexOf(n) < 0 && !RUN_SCRIPT_SKIP.test(n)))
-        for (const name of ordered.slice(0, 6)) {
-          push({
-            id: 'pm:' + name,
-            label: pm + ' run ' + name,
-            command: runner + ' run ' + name,
-            kind: 'node',
-            source: pmSource,
-            detail: String(scripts[name] === undefined ? '' : scripts[name]).slice(0, 90) + ' · ' + pmNote,
-          })
-        }
-        const main = pkg && typeof pkg.main === 'string' ? pkg.main : (pkg && typeof pkg.bin === 'string' ? pkg.bin : null)
-        if (main && await existsRel(main)) {
-          push({ id: 'node:main', label: 'node ' + main, command: nodeRun.command + ' ' + termQuote(main), kind: 'node', source: nodeRun.source, detail: 'package.json main · ' + noteOf(nodeRun) })
-        }
-        const localTsx = await firstExisting(['node_modules/.bin/tsx.cmd', 'node_modules/.bin/tsx'])
-        if (localTsx && activePath && /\.(ts|mts|cts)$/i.test(activePath)) {
-          push({ id: 'tsx:active', label: 'tsx ' + activePath, command: localExe(localTsx) + ' ' + termQuote(activePath), kind: 'node', source: 'local', detail: '当前文件 · 本地 ' + localTsx })
-        }
+      // ---- the command, for this one file ----
+      // Every path here is ABSOLUTE: the terminal's cwd follows the user's own
+      // `cd`, so a relative script path would silently point at the wrong place.
+      const quoted = termQuote(abs)
+      const mkCand = (id, label, command, source, note, kindName) => ({
+        id: id,
+        label: label,
+        command: command,
+        kind: kindName,
+        source: source,
+        detail: '当前文件 · ' + (note ? '本地 ' + note : '全局 PATH'),
+        // Exactly one target exists, so the client runs it without asking.
+        primary: true,
+      })
+      const mkRunner = (id, go, kindName) => mkCand(id, go.label + ' ' + name, go.command + ' ' + quoted, go.source, go.note, kindName)
+      if (kind === 'python') {
+        const pyRun = await resolveExe(pyExeNames, process.platform === 'win32' ? 'python' : 'python3')
+        return { candidates: [mkRunner('py:active', pyRun, 'python')], reason: null }
       }
-
-      // ---- Python ----
-      // Local interpreter: .venv/venv/env, python-looking folders, the project
-      // root, bin/Scripts/tools/... Only when none exists does the bare
-      // `python`/`python3` fall back to PATH (flagged 全局 in the picker).
-      const pyRun = await resolveExe(pyExeNames, process.platform === 'win32' ? 'python' : 'python3')
-      const py = pyRun.command
-      const pySource = pyRun.source
-      const pyNote = noteOf(pyRun)
-      if (has('manage.py')) {
-        push({ id: 'django', label: pyRun.label + ' manage.py runserver', command: py + ' manage.py runserver', kind: 'python', source: pySource, detail: 'Django · ' + pyNote })
+      if (kind === 'node') {
+        const nodeRun = await resolveExe(exeNames('node'), 'node')
+        return { candidates: [mkRunner('node:active', nodeRun, 'node')], reason: null }
       }
-      const pyEntry = await firstExisting(['main.py', 'app.py', 'run.py', 'server.py', 'src/main.py', 'src/app.py', '__main__.py'])
-      if (pyEntry) {
-        push({ id: 'py:entry', label: pyRun.label + ' ' + pyEntry, command: py + ' ' + pyEntry, kind: 'python', source: pySource, detail: '入口脚本 · ' + pyNote })
+      if (kind === 'tsx') {
+        // TypeScript needs the project-local tsx: there is no global fallback
+        // worth trusting, and a bare `node x.ts` has never worked.
+        const tsx = await firstExisting(['node_modules/.bin/tsx.cmd', 'node_modules/.bin/tsx'])
+        if (!tsx) return none('运行 .ts 需要项目本地的 tsx（node_modules/.bin/tsx）')
+        return { candidates: [mkCand('tsx:active', tsx + ' ' + name, localExe(tsx) + ' ' + quoted, 'local', tsx, 'node')], reason: null }
       }
-      if (has('pyproject.toml') && !pyEntry) {
-        const toml = (await readRel('pyproject.toml')) || ''
-        const m = /\[project\.scripts\][^[]*?^\s*([A-Za-z0-9_.-]+)\s*=/m.exec(toml)
-        if (m) push({ id: 'py:script', label: pyRun.label + ' -m ' + m[1], command: py + ' -m ' + m[1], kind: 'python', source: pySource, detail: 'pyproject [project.scripts] · ' + pyNote })
+      if (kind === 'pwsh') {
+        if (TERM_SHELL.dialect !== 'pwsh') return none('当前终端不是 PowerShell，无法直接运行 .ps1')
+        return { candidates: [mkCand('ps1:active', name, '& ' + quoted, 'local', rel, 'script')], reason: null }
       }
-
-      // ---- Rust / Go / .NET ----
-      // Resolved locals first (a toolchain unpacked into tools/ or bin/ is
-      // common for portable builds); the bare command is the PATH fallback.
-      if (has('Cargo.toml')) {
-        const cargo = await resolveExe(exeNames('cargo'), 'cargo')
-        push({ id: 'cargo', label: cargo.label + ' run', command: cargo.command + ' run', kind: 'rust', source: cargo.source, detail: 'Cargo.toml · ' + noteOf(cargo) })
-      }
-      if (has('go.mod')) {
-        const go = await resolveExe(exeNames('go'), 'go')
-        push({ id: 'go', label: go.label + ' run .', command: go.command + ' run .', kind: 'go', source: go.source, detail: 'go.mod · ' + noteOf(go) })
-      }
-      const csproj = entries.filter((e) => e.type === 'file' && /\.(cs|fs|vb)proj$/i.test(e.name))[0]
-      if (csproj || entries.some((e) => e.type === 'file' && /\.sln$/i.test(e.name))) {
-        const dotnet = await resolveExe(exeNames('dotnet'), 'dotnet')
-        push({ id: 'dotnet', label: dotnet.label + ' run', command: dotnet.command + ' run', kind: 'dotnet', source: dotnet.source, detail: (csproj ? csproj.name : '解决方案文件') + ' · ' + noteOf(dotnet) })
-      }
-
-      // ---- Java (Gradle / Maven) ----
-      const gradlew = await firstExisting(['gradlew.bat', 'gradlew'])
-      const buildGradle = (await readRel('build.gradle')) || (await readRel('build.gradle.kts')) || ''
-      if (gradlew) {
-        const boot = /org\.springframework\.boot|spring-boot/i.test(buildGradle)
-        const task = boot ? 'bootRun' : 'run'
-        const cmd = (process.platform === 'win32' && /\.bat$/.test(gradlew) ? '.\\' + gradlew : './' + gradlew) + ' ' + task
-        push({ id: 'gradle', label: gradlew + ' ' + task, command: cmd, kind: 'java', source: 'local', detail: (boot ? 'Spring Boot' : 'Gradle') + ' · 本地 ' + gradlew })
-      }
-      const pom = await readRel('pom.xml')
-      if (pom && /spring-boot/i.test(pom)) {
-        const mvnw = await firstExisting(['mvnw.cmd', 'mvnw'])
-        const mvn = mvnw ? (process.platform === 'win32' && /\.cmd$/.test(mvnw) ? '.\\' + mvnw : './' + mvnw) : 'mvn'
-        push({ id: 'maven', label: mvn + ' spring-boot:run', command: mvn + ' spring-boot:run', kind: 'java', source: mvnw ? 'local' : 'global', detail: 'Spring Boot · ' + (mvnw ? '本地 ' + mvnw : '全局 PATH') })
-      }
-
-      // ---- Make / task runners ----
-      const makefile = has('Makefile') ? 'Makefile' : has('makefile') ? 'makefile' : null
-      if (makefile) {
-        const body = (await readRel(makefile)) || ''
-        const target = /^run\s*:/m.test(body) ? 'run' : (/^dev\s*:/m.test(body) ? 'dev' : '')
-        const make = await resolveExe(exeNames('make'), 'make')
-        push({ id: 'make', label: make.label + (target ? ' ' + target : ''), command: make.command + (target ? ' ' + target : ''), kind: 'make', source: make.source, detail: makefile + ' · ' + noteOf(make) })
-      }
-
-      // ---- PHP / Ruby ----
-      if (has('artisan')) {
-        const php = await resolveExe(exeNames('php'), 'php')
-        push({ id: 'artisan', label: php.label + ' artisan serve', command: php.command + ' artisan serve', kind: 'php', source: php.source, detail: 'Laravel · ' + noteOf(php) })
-      } else if (hasDir('public') && await existsRel('public/index.php')) {
-        const php = await resolveExe(exeNames('php'), 'php')
-        push({ id: 'php:serve', label: php.label + ' -S localhost:8000 -t public', command: php.command + ' -S localhost:8000 -t public', kind: 'php', source: php.source, detail: 'PHP 内置服务器 · ' + noteOf(php) })
-      } else if (has('composer.json')) {
-        let comp = null
-        try { comp = JSON.parse((await readRel('composer.json')) || '{}') } catch (e) { comp = null }
-        if (comp && comp.scripts && comp.scripts.start) {
-          const composer = await resolveExe(exeNames('composer').concat(process.platform === 'win32' ? ['composer.bat'] : []), 'composer')
-          push({ id: 'composer:start', label: composer.label + ' start', command: composer.command + ' start', kind: 'php', source: composer.source, detail: 'composer script · ' + noteOf(composer) })
-        }
-      }
-      if (has('Gemfile')) {
-        const bundle = await resolveExe(exeNames('bundle').concat(process.platform === 'win32' ? ['bundle.bat', 'bundle.cmd'] : []), 'bundle')
-        const ruby = await resolveExe(exeNames('ruby'), 'ruby')
-        if (has('config.ru')) push({ id: 'rack', label: bundle.label + ' exec rackup', command: bundle.command + ' exec rackup', kind: 'ruby', source: bundle.source, detail: 'config.ru · ' + noteOf(bundle) })
-        else if (has('app.rb')) push({ id: 'ruby:app', label: bundle.label + ' exec ruby app.rb', command: bundle.command + ' exec ruby app.rb', kind: 'ruby', source: bundle.source, detail: 'app.rb · ' + noteOf(bundle) + ' · ruby ' + ruby.label })
-      }
-
-      // ---- Docker compose ----
-      if (has('docker-compose.yml') || has('docker-compose.yaml') || has('compose.yml') || has('compose.yaml')) {
-        const docker = await resolveExe(exeNames('docker'), 'docker')
-        push({ id: 'compose', label: docker.label + ' compose up', command: docker.command + ' compose up', kind: 'docker', source: docker.source, detail: 'Compose 文件 · ' + noteOf(docker) })
-      }
-
-      // ---- project scripts ----
-      const ps1 = await firstExisting(['run.ps1', 'start.ps1', 'dev.ps1', 'scripts/run.ps1'])
-      if (ps1 && TERM_SHELL.dialect === 'pwsh') {
-        push({ id: 'ps1', label: ps1, command: '& ' + termQuote(joinPath(root, ps1)), kind: 'script', source: 'local', detail: 'PowerShell 脚本 · 本地 ' + ps1 })
-      }
-      const shScript = await firstExisting(['run.sh', 'start.sh', 'dev.sh', 'scripts/run.sh'])
-      if (shScript) {
-        const bash = await resolveExe(exeNames('bash'), 'bash')
-        push({ id: 'sh', label: bash.label + ' ' + shScript, command: bash.command + ' ' + termQuote(shScript), kind: 'script', source: bash.source, detail: 'Shell 脚本 · ' + noteOf(bash) })
-      }
-
-      // ---- static site (only when nothing else matched) ----
-      if (out.length === 0 && has('index.html')) {
-        push({ id: 'static', label: pyRun.label + ' -m http.server 8000', command: py + ' -m http.server 8000', kind: 'static', source: pySource, detail: '静态站点 · ' + pyNote })
-      }
-
-      // ---- active file fallback ----
-      // This is the "open a .py and hit 运行" path, so the local interpreter
-      // matters most here.
-      if (out.length === 0 && activePath) {
-        const ext = activePath.split('.').pop().toLowerCase()
-        if (ext === 'js' || ext === 'mjs' || ext === 'cjs') {
-          push({ id: 'node:active', label: nodeRun.label + ' ' + activePath, command: nodeRun.command + ' ' + termQuote(activePath), kind: 'node', source: nodeRun.source, detail: '当前文件 · ' + noteOf(nodeRun) })
-        } else if (ext === 'py') {
-          push({ id: 'py:active', label: pyRun.label + ' ' + activePath, command: py + ' ' + termQuote(activePath), kind: 'python', source: pySource, detail: '当前文件 · ' + pyNote })
-        } else if (ext === 'ps1' && TERM_SHELL.dialect === 'pwsh') {
-          push({ id: 'ps1:active', label: activePath, command: '& ' + termQuote(joinPath(root, activePath)), kind: 'script', source: 'local', detail: '当前文件 · 本地 ' + activePath })
-        } else if (ext === 'sh') {
-          const bashActive = await resolveExe(exeNames('bash'), 'bash')
-          push({ id: 'sh:active', label: bashActive.label + ' ' + activePath, command: bashActive.command + ' ' + termQuote(activePath), kind: 'script', source: bashActive.source, detail: '当前文件 · ' + noteOf(bashActive) })
-        }
-      }
-
-      // local environments first, stable inside each group
-      const ranked = out.map((c, i) => ({ c, i })).sort((a, b) => {
-        const d = (a.c.source === 'local' ? 0 : 1) - (b.c.source === 'local' ? 0 : 1)
-        return d !== 0 ? d : a.i - b.i
-      }).map((x) => x.c)
-      return ranked.slice(0, 8)
+      const bashRun = await resolveExe(exeNames('bash'), 'bash')
+      return { candidates: [mkRunner('sh:active', bashRun, 'script')], reason: null }
     }
 
     // ---------- HTTP carrier ----------

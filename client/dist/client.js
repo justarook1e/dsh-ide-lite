@@ -149,10 +149,12 @@ window.__ModuleLoader__.load({
           },
           onDockH(f) { this.dockSubs.add(f); return () => { this.dockSubs.delete(f) } },
           requestRefresh() { this.refreshTick++; this.emit() },
-          // v1.24: the project run-target picker. Rendered by FileView (NOT by
-          // the button) because the toolbar is a `position:sticky; z-index:5`
-          // stacking context — a fixed menu inside it would paint below the
-          // shell's resize handle (z-index 8). Same layer as the save dialog.
+          // v1.24: the run notice — why the open file cannot be run. Rendered by
+          // FileView (NOT by the button) because the toolbar is a
+          // `position:sticky; z-index:5` stacking context — a fixed layer inside
+          // it would paint below the shell's resize handle (z-index 8). Same layer
+          // as the save dialog. (v1.32.9: the target PICKER this slot used to hold
+          // is gone — there is at most one target now.)
           runMenu: null,
           setRunMenu(v) { this.runMenu = v; this.emit() },
           emit() { this.rev++; const subs = Array.from(this.subs); for (const f of subs) { try { f() } catch (e) {} } },
@@ -573,10 +575,17 @@ window.__ModuleLoader__.load({
               return {
                 ok: false,
                 candidates: [],
+                reason: null,
                 error: /no such method|not found/i.test(raw) ? '宿主插件仍是旧版本：请重启 DSH 后重试（也可在终端中手动输入命令）。' : raw,
               }
             }
-            return { ok: true, candidates: Array.isArray(r.candidates) ? r.candidates : [] }
+            return {
+              ok: true,
+              candidates: Array.isArray(r.candidates) ? r.candidates : [],
+              // v1.32.9: the host explains why a file cannot be run; the greyed
+              // button shows it as its tooltip and as a notice on click.
+              reason: r.reason ? String(r.reason) : null,
+            }
           },
         }
         // v1.22 search box: ESC must close it from anywhere in the view, not
@@ -1554,13 +1563,14 @@ window.__ModuleLoader__.load({
           '.dsh-fe-term-prompt-on { color:var(--dsw-alias-state-success-primary); }',
           '.dsh-fe-term-input { flex:1; min-width:0; border:none; outline:none; background:transparent; color:var(--dsw-alias-label-primary); font-family:ui-monospace,Consolas,monospace; font-size:12.5px; padding:3px 0; }',
           '.dsh-fe-term-input::placeholder { color:var(--dsw-alias-label-secondary); opacity:.7; }',
-          // v1.29: icon-only run control. The old form was a text button
-          // ("运行" / "停止" / "识别中…") plus a separate caret button whose only
-          // job was opening the target picker; the label is now the tooltip and
-          // the button is a 22px square matching the toolbar's IconBtns, so the
-          // whole run affordance is one glyph. A single candidate still runs
-          // straight away; several (or a right-click for one) open the picker
-          // after a short press so a quick click cannot flash the veil.
+          // v1.29: icon-only run control — the label is the tooltip and the button
+          // is a 22px square matching the toolbar's IconBtns, so the whole run
+          // affordance is one glyph.
+          // v1.32.9: that glyph has ONE meaning — run the file that is open. The
+          // project-entry scanner and its right-click picker are gone with it. The
+          // button probes on mount and on every tab switch so its tooltip names the
+          // exact command BEFORE it runs, and a file that cannot be run is greyed,
+          // with the reason as its tooltip and as a notice on click.
           '.dsh-fe-runbtn { display:inline-flex; align-items:center; justify-content:center; gap:0; flex:none; margin-left:6px; width:22px; height:22px; padding:0; border:1px solid color-mix(in srgb, var(--dsw-alias-state-success-primary) 55%, transparent); background:transparent; color:var(--dsw-alias-state-success-primary); border-radius:6px; font-size:12px; cursor:pointer; transition:background .12s ease,color .12s ease,border-color .12s ease; }',
           '.dsh-fe-runbtn:hover { background:color-mix(in srgb, var(--dsw-alias-state-success-primary) 12%, transparent); }',
           '.dsh-fe-runbtn:focus-visible { outline:1px solid var(--dsw-alias-state-success-primary); outline-offset:1px; }',
@@ -1569,6 +1579,11 @@ window.__ModuleLoader__.load({
           '.dsh-fe-runbtn-wait { opacity:.55; }',
           '.dsh-fe-runbtn-busy { border-color:color-mix(in srgb, var(--dsw-alias-state-error-primary) 55%, transparent); color:var(--dsw-alias-state-error-primary); }',
           '.dsh-fe-runbtn-busy:hover { background:color-mix(in srgb, var(--dsw-alias-state-error-primary) 10%, transparent); }',
+          // v1.32.9: the open file cannot be run (not a runnable extension, binary,
+          // missing…). Greyed instead of hidden so the affordance stays put, and it
+          // stays clickable so the click can explain WHY (a disabled button cannot).
+          '.dsh-fe-runbtn-off { border-color:var(--dsw-alias-border-l1); color:var(--dsw-alias-label-secondary); cursor:not-allowed; opacity:.9; }',
+          '.dsh-fe-runbtn-off:hover { background:transparent; }',
           '.dsh-fe-runmenu { position:fixed; z-index:31; min-width:280px; max-width:min(520px, calc(100vw - 32px)); display:flex; flex-direction:column; gap:1px; padding:4px; border:1px solid var(--dsw-alias-border-l1); border-radius:8px; background:var(--dsw-alias-bg-layer-2); box-shadow:var(--dsw-shadow-lv2, 0 12px 32px rgba(0,0,0,.18)); transform-origin:top right; animation:dsh-fe-menu-in .14s ease-out; }',
           // The picker layer is rendered by FileView (RunMenuLayer), NOT by the
           // toolbar button: the toolbar is a sticky z-index:5 stacking context,
@@ -1583,6 +1598,8 @@ window.__ModuleLoader__.load({
           '.dsh-fe-runmenu-src-local { color:var(--dsw-alias-state-success-primary); border-color:color-mix(in srgb, var(--dsw-alias-state-success-primary) 55%, transparent); }',
           '.dsh-fe-runmenu-detail { font-size:11px; color:var(--dsw-alias-label-secondary); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }',
           '.dsh-fe-runmenu-foot { font-size:10.5px; color:var(--dsw-alias-label-secondary); padding:5px 8px 3px; border-top:1px solid var(--dsw-alias-border-l1); margin-top:2px; }',
+          '.dsh-fe-runmenu-ok { align-self:flex-end; margin:5px 6px 3px; padding:3px 12px; border:1px solid var(--dsw-alias-border-l1); border-radius:6px; background:transparent; color:var(--dsw-alias-label-primary); font-size:12px; cursor:pointer; }',
+          '.dsh-fe-runmenu-ok:hover { background:color-mix(in srgb, var(--dsw-alias-label-secondary) 12%, transparent); }',
           '@media (prefers-reduced-motion: reduce) { .dsh-fe-term-dot-on { animation:none; } }',
           // ---- v1.28: no shell width handles over the 文件/终端 views ----
           // DSH 0.1.5-rc.1's ConversationRoot renders two 40px col-resize strips
@@ -5267,7 +5284,7 @@ window.__ModuleLoader__.load({
             actionButtons,
             // v1.24: project run button lives at the right end of the row under
             // the file tab strip (this toolbar).
-            React.createElement(RunButton, { key: 'run', sid: sid, path: path }),
+            React.createElement(RunButton, { key: 'run', sid: sid, path: path, beforeRun: ensureSaved }),
           )
           // Deleted files: banner instead of a misleading red-line diff. The
           // toolbar still offers accept (confirm deletion) / reject (restore).
@@ -7092,6 +7109,11 @@ window.__ModuleLoader__.load({
           // DiffPane passes `sid`; accept `sessionId` too so the button keeps
           // working if it is ever mounted from a session-scoped slot.
           const sid = props && (props.sessionId || props.sid)
+          const path = String((props && props.path) || '')
+          // v1.32.9: unsaved edits are flushed before the run (IDE behaviour) —
+          // DiffPane hands its own ensureSaved() down, and a refused save aborts
+          // the run instead of silently executing the bytes on disk.
+          const beforeRun = props && props.beforeRun
           const [, force] = React.useState(0)
           React.useEffect(() => {
             if (!sid) return undefined
@@ -7100,8 +7122,11 @@ window.__ModuleLoader__.load({
           const t = sid ? termStore.rec(sid) : null
           const btnRef = React.useState({ el: null })[0]
           const [detecting, setDetecting] = React.useState(false)
+          // Latest probe: null until the first one lands. The tooltip is the ONLY
+          // place the target is named before the click, so this runs on mount and on
+          // every tab switch (cheap: the host resolves the one open file).
+          const [probe, setProbe] = React.useState(null)
           const busy = !!(t && t.busy)
-          const menu = store.runMenu
           const place = () => {
             const el = btnRef.el
             const rect = el && el.getBoundingClientRect ? el.getBoundingClientRect() : null
@@ -7113,98 +7138,62 @@ window.__ModuleLoader__.load({
           const detect = async () => {
             if (!sid) return null
             setDetecting(true)
-            const r = await termStore.detect(sid, props.path || '')
+            const r = await termStore.detect(sid, path)
             setDetecting(false)
+            setProbe(r)
             return r
           }
-          // Opens the run-target picker at the button (shared by the multi-
-          // candidate path and the right-click shortcut).
-          const openMenu = async () => {
+          React.useEffect(() => { setProbe(null); void detect() }, [sid, path])
+          const cand = probe && probe.ok !== false && probe.candidates && probe.candidates.length > 0 ? probe.candidates[0] : null
+          const why = !probe
+            ? '检测中…'
+            : (probe.ok === false ? (probe.error || '检测失败') : (probe.reason || '当前文件不可运行'))
+          // The greyed state keeps its click: a disabled button cannot explain
+          // itself (and its title may never be shown at all).
+          const notice = () => { store.setRunMenu({ ...place(), reason: why }) }
+          const onMain = async () => {
             if (!sid) return
-            store.setRunMenu({ ...place(), sid: sid, items: [], error: null, loading: true })
-            const r = await detect()
-            const cur = store.runMenu
-            if (cur) store.setRunMenu({ ...cur, items: r ? r.candidates : [], error: r && !r.ok ? r.error : null, loading: false })
-          }
-          // v1.29: one glyph, three gestures —
-          //   left click  : run the project (the only candidate runs straight
-          //                 away; several open the picker);
-          //   right click : always open the picker, even with one candidate;
-          //   while busy  : left click interrupts (same as before), and since
-          //                 the only run is already in flight a right-click is
-          //                 deliberately ignored instead of raising the veil.
-          // A left click waits one frame-ish before acting so a right-click
-          // (which fires pointerdown/contextmenu first) can cancel it.
-          const clickTimer = React.useState({ id: null })[0]
-          const cancelClick = () => {
-            if (clickTimer.id !== null) { clearTimeout(clickTimer.id); clickTimer.id = null }
-          }
-          React.useEffect(() => () => cancelClick(), [])
-          const onMain = () => {
-            if (!sid) return
-            cancelClick()
             if (busy) { void termStore.signal(sid); return }
-            clickTimer.id = setTimeout(() => { clickTimer.id = null; void runOrPick() }, 200)
-          }
-          const onContextMenu = (ev) => {
-            ev.preventDefault()
-            cancelClick()
-            if (busy) return
-            void openMenu()
-          }
-          const runOrPick = async () => {
+            if (!cand) { notice(); return }
+            if (typeof beforeRun === 'function' && !(await beforeRun())) return
+            // Re-probe: the runtime may have been provisioned, or the file replaced,
+            // since the mount probe — that answer only ever fed the tooltip.
             const r = await detect()
-            if (!r) return
-            if (r.candidates.length === 1) { await runProjectTarget(sid, r.candidates[0].command); return }
-            await openMenu()
+            const go = r && r.ok !== false && r.candidates && r.candidates[0] ? r.candidates[0] : null
+            if (!go) { notice(); return }
+            switchToTerminalView()
+            await termStore.run(sid, go.command, 'run')
           }
           return React.createElement('button', {
             type: 'button',
             ref: (node) => { btnRef.el = node },
-            className: 'dsh-fe-runbtn' + (busy ? ' dsh-fe-runbtn-busy' : (detecting ? ' dsh-fe-runbtn-wait' : '')),
+            className: 'dsh-fe-runbtn' + (busy ? ' dsh-fe-runbtn-busy' : (detecting ? ' dsh-fe-runbtn-wait' : '')) + (!busy && !cand ? ' dsh-fe-runbtn-off' : ''),
             title: busy
               ? '停止：中断当前运行的进程'
-              : '运行项目（自动识别语言/框架，项目本地环境优先）· 右键选择运行目标',
-            'aria-label': busy ? '停止运行' : '运行项目',
+              : (cand ? ('运行 ' + cand.label + (cand.detail ? '  ·  ' + cand.detail : '')) : why),
+            'aria-label': busy ? '停止运行' : (cand ? '运行当前文件' : '当前文件不可运行'),
+            'aria-disabled': (!busy && !cand) ? 'true' : undefined,
             'aria-busy': detecting || undefined,
-            onClick: onMain,
-            onContextMenu: onContextMenu,
+            onClick: () => { void onMain() },
           }, busy ? IconStop() : IconPlay())
         }
-        // The run-target picker itself, rendered by FileView at the dialog layer.
+        // v1.32.9: with at most one target there is nothing to pick, so the old
+        // picker is gone. Its layer stays, reused as the NOTICE that explains a
+        // greyed button (still rendered by FileView — see store.runMenu).
         const closeRunMenu = () => { if (store.runMenu) store.setRunMenu(null) }
-        const runProjectTarget = async (sid, command) => {
-          closeRunMenu()
-          switchToTerminalView()
-          await termStore.run(sid, command, 'run')
-        }
         function RunMenuLayer() {
           const menu = store.runMenu
           if (!menu) return null
           return React.createElement('div', { className: 'dsh-fe-runmenu-layer' },
             React.createElement('div', { className: 'dsh-fe-menu-veil', onClick: () => closeRunMenu() }),
             React.createElement('div', { className: 'dsh-fe-runmenu', style: { top: menu.top, right: menu.right } },
-              React.createElement('div', { className: 'dsh-fe-runmenu-head' }, '运行项目'),
-              menu.loading ? React.createElement('div', { className: 'dsh-fe-runmenu-empty' }, '检测中…') : null,
-              !menu.loading && menu.items.length === 0
-                ? React.createElement('div', { className: 'dsh-fe-runmenu-empty' }, menu.error || '未识别到可运行入口，可在「终端」中直接输入命令。')
-                : null,
-              (menu.items || []).map((c) => React.createElement('button', {
-                key: c.id || c.command,
-                type: 'button',
-                className: 'dsh-fe-runmenu-item',
-                title: c.command + (c.detail ? '  ·  ' + c.detail : ''),
-                onClick: () => { void runProjectTarget(menu.sid, c.command) },
-              },
-                React.createElement('span', { className: 'dsh-fe-runmenu-label' }, c.label),
-                React.createElement('span', { className: 'dsh-fe-runmenu-src' + (c.source === 'local' ? ' dsh-fe-runmenu-src-local' : '') }, c.source === 'local' ? '本地' : '全局'),
-                c.detail ? React.createElement('span', { className: 'dsh-fe-runmenu-detail' }, c.detail) : null,
-              )),
-              React.createElement('div', { className: 'dsh-fe-runmenu-foot' }, '项目本地环境优先；在终端中可查看完整输出'),
+              React.createElement('div', { className: 'dsh-fe-runmenu-head' }, '无法运行'),
+              React.createElement('div', { className: 'dsh-fe-runmenu-empty' }, menu.reason || '当前文件不可运行'),
+              React.createElement('div', { className: 'dsh-fe-runmenu-foot' }, '可运行的文件：.py / .js / .mjs / .cjs / .ts / .ps1 / .sh；其它命令请在「终端」中输入'),
+              React.createElement('button', { type: 'button', className: 'dsh-fe-runmenu-ok', onClick: () => closeRunMenu() }, '知道了'),
             ),
           )
         }
-
         // ---------- registrations ----------
         ensureStyle()
         ctx.effect(() => removeStyle, 'dsh-file-edit: stylesheet')
