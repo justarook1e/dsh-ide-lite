@@ -95,6 +95,14 @@ window.__ModuleLoader__.load({
           // Pending save-confirmation dialog (rendered by FileView):
           // { paths, reason, resolve } — resolved with 'save'|'discard'|'cancel'.
           askSave: null,
+          // v1.32.8: reject outcomes that DID something the user must read
+          // (files the batch reject refused to touch). The per-panel
+          // `setError` row is wiped by the very refresh() that follows the
+          // action, so the text only flashed for one frame; a store-held
+          // notice survives every re-render/poll and is dismissed explicitly
+          // by the user. Shape: { count, items:[{path,error}] } | null.
+          rejectNotice: null,
+          setRejectNotice(v) { this.rejectNotice = v; this.emit() },
           treeStamp: 0,
           // Cross-view refresh signal: any component that changes review
           // state (hunk accept/reject, file accept/reject, inline edit)
@@ -1417,6 +1425,13 @@ window.__ModuleLoader__.load({
           '.dsh-fe-sess-pin { flex:none; display:inline-flex; margin-left:-1px; padding:2px; border-radius:5px; color:var(--dsw-alias-state-warn-primary); cursor:pointer; transition:background .12s ease, color .12s ease; }',
           '.dsh-fe-sess-pin:hover { background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 16%, transparent); color:var(--dsw-alias-state-warn-primary); }',
           '.dsh-fe-sess-pin:focus-visible { outline:2px solid color-mix(in srgb, var(--dsw-alias-label-primary) 45%, transparent); outline-offset:1px; }',
+          // v1.32.8: one rejected file inside the reject-refused dialog. The
+          // path/error pair reuses .dsh-fe-ask-path + .dsh-fe-err so the dialog
+          // needs no new colours; only the grouping and the thin separator are
+          // new. First item has no rule (the body's own line acts as the head).
+          '.dsh-fe-reject-item { margin-top:6px; padding-top:6px; border-top:1px solid var(--dsw-alias-border-l1); }',
+          '.dsh-fe-reject-item .dsh-fe-ask-path { margin:0; }',
+          '.dsh-fe-reject-item .dsh-fe-err { padding:2px 0 0; }',
           '.dsh-fe-menu-veil { position:fixed; inset:0; z-index:29; }',
           '.dsh-fe-sess-menu { position:fixed; z-index:31; display:flex; flex-direction:column; gap:1px; padding:3px; border:1px solid var(--dsw-alias-border-l1); border-radius:8px; background:var(--dsw-alias-bg-layer-2); box-shadow:var(--dsw-shadow-lv2, 0 12px 32px rgba(0,0,0,.18)); transform-origin:top right; animation:dsh-fe-menu-in .14s ease-out; }',
           '.dsh-fe-sess-menu-close { animation:dsh-fe-menu-out .12s ease-in forwards; }',
@@ -2586,7 +2601,13 @@ window.__ModuleLoader__.load({
             // the review last saw them) — the row list keeps them, so say so
             // instead of skipping them silently. Same pattern as the
             // undoReject skipped list above.
-            else if (r.failed && r.failed.length > 0) setError('有 ' + r.failed.length + ' 个文件未拒绝（无法证明是 AI 新建，或已被再次修改），已保留原文件')
+            // v1.32.8: this MUST NOT go through setError. The refresh() two
+            // lines below (and every 6s poll after it) re-renders this panel
+            // with error=-null, so the message survived exactly one frame —
+            // the "闪一下就没" report. `r.failed` carries the FULL message per
+            // file (host rejectAll pushes {path, error}), so the dialog can
+            // show the real reason instead of the summary line it used to.
+            else if (r.failed && r.failed.length > 0) store.setRejectNotice({ count: r.failed.length, items: r.failed })
             await refresh()
             store.requestRefresh()
           }
@@ -2673,9 +2694,43 @@ window.__ModuleLoader__.load({
               rowSet.map((r) => React.createElement('div', {
                 key: r.path,
                 className: 'dsh-fe-anim' + (r.leaving ? ' dsh-fe-row-leave' : (r.enter ? ' dsh-fe-row-enter' : '')),
-              }, React.createElement(FileRow, { item: r.item, sid: sid, onDone: refresh, onError: setError })))),
+              }, React.createElement(FileRow, {
+                item: r.item,
+                sid: sid,
+                onDone: refresh,
+                // v1.32.8: a refused reject carries the per-file reason in
+                // `r.error`; a batch/other failure still uses the inline row.
+                onError: (msg) => store.setRejectNotice({ count: 1, items: [{ path: r.item.path, error: msg }] }),
+              })))),
           ]
           const barStyle = overlay && overlayBottom !== null ? { bottom: overlayBottom + 'px' } : null
+          // v1.32.8: the per-file ✗ (FileRow `onError`) used to land in the
+          // transient `setError` row and was wiped by the `onDone()` refetch
+          // that FileRow runs immediately after — the same flash-then-vanish as
+          // the batch path. Route rejects through the store notice instead, and
+          // render the dialog HERE so it works even when 文件 view was never
+          // opened (the dialog must not depend on FileView being mounted).
+          const rejectDialog = store.rejectNotice ? React.createElement('div', { className: 'dsh-fe-ask-mask' },
+            React.createElement('div', { className: 'dsh-fe-ask-card' },
+              React.createElement('div', { className: 'dsh-fe-ask-title' }, '拒绝未完全生效'),
+              React.createElement('div', { className: 'dsh-fe-ask-body' },
+                '有 ' + store.rejectNotice.count + ' 个文件未被拒绝，原文件已保留：',
+                store.rejectNotice.items.map((it) => React.createElement('div', {
+                  key: it.path,
+                  className: 'dsh-fe-reject-item',
+                },
+                  React.createElement('div', { className: 'dsh-fe-ask-path' }, it.path),
+                  it.error ? React.createElement('div', { className: 'dsh-fe-err' }, String(it.error)) : null,
+                )),
+              ),
+              React.createElement('div', { className: 'dsh-fe-ask-actions' },
+                React.createElement('button', {
+                  className: 'dsh-fe-btn dsh-fe-btn-ok',
+                  onClick: () => store.setRejectNotice(null),
+                }, '知道了'),
+              ),
+            ),
+          ) : null
           return React.createElement(React.Fragment, null,
             React.createElement('span', { ref: (node) => { anchorRef.node = node }, className: 'dsh-fe-dock-anchor' }),
             React.createElement('div', {
@@ -2687,6 +2742,7 @@ window.__ModuleLoader__.load({
               React.createElement('div', { className: 'dsh-fe-body' },
                 React.createElement('div', { className: 'dsh-fe-body-inner' }, bodyInner)),
             ),
+            rejectDialog,
           )
         }
 
@@ -6810,6 +6866,12 @@ window.__ModuleLoader__.load({
               ),
             ),
           ) : null
+          // v1.32.8: reject-refused dialog. Deliberately NOT dismissible by
+          // clicking the mask or with Escape (the save dialog is): this is the
+          // outcome of an explicit destructive action and the only place the
+          // per-file reason is ever shown, so it stays until acknowledged.
+          // Same layer + classes as the save dialog (fixed overlay, z-index 60)
+          // because it must paint above the sticky toolbar and the file view.
           // v1.13: closing a tab with unsaved edits asks first (req 6).
           const closeTabWithPrompt = async (t) => {
             const m = editModels.get(editKeyOf(store.root, t))
@@ -6859,8 +6921,19 @@ window.__ModuleLoader__.load({
           const active = store.active
           const dirty = store.dirtyFiles
           if (tabs.length === 0) {
-            return React.createElement('div', { className: 'dsh-fe-viewer' },
-              React.createElement('div', { className: 'dsh-fe-msg' }, '没有打开的文件：在左侧工作区的「项目文件」中点击/双击文件，或点击修改文件列表中的路径。'))
+            // v1.32.8: the save dialog is a sibling of the viewer, NOT a member
+            // of the tabbed branch — closing a tab needs no open tab, so
+            // returning the bare empty state here dropped it. Both branches
+            // therefore carry `askOverlay`.
+            // NOTE: the reject dialog deliberately does NOT live here — it is
+            // rendered by ModifiedBar (the component whose buttons raise it),
+            // because the bar is always mounted and this view is not; rendering
+            // it in both slots would stack two identical masks.
+            return React.createElement(React.Fragment, null,
+              React.createElement('div', { className: 'dsh-fe-viewer' },
+                React.createElement('div', { className: 'dsh-fe-msg' }, '没有打开的文件：在左侧工作区的「项目文件」中点击/双击文件，或点击修改文件列表中的路径。')),
+              askOverlay,
+            )
           }
           return React.createElement(React.Fragment, null,
             React.createElement('div', { className: 'dsh-fe-viewer', ref: (node) => { viewerRef.node = node } },

@@ -1,6 +1,6 @@
 {
   "name": "@justarook1e/dsh-ide-lite",
-  "version": "1.32.7",
+  "version": "1.32.8",
   "description": "Workspace file browser with agent-change review (accept/reject + undo), full user editing (undo/redo, save, auto-save), diff view and rendered markdown, plus an integrated terminal view with auto-detected project run targets (static host+client plugin)",
   "type": "module",
   "main": "host/index.mjs",

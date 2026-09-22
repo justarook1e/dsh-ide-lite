@@ -4563,14 +4563,22 @@ export default {
       const rootCache = new Map()
       // One listDir per directory (memoized): cheaper and race-free compared
       // with stat-ing every candidate path, and a missing directory is simply
-      // an empty set.
+      // an empty map.
+      //
+      // v1.32.8: the value is the entry TYPE, not just its presence. A bare
+      // name match used to accept a DIRECTORY as an executable, which is how
+      // `runtime/python/` (the embeddable-interpreter container) became the
+      // command `& "<root>\runtime\python"` — PowerShell answers that with a
+      // CommandNotFoundException ("不是 cmdlet、函数、脚本文件或可运行程序"),
+      // as if the path were a typo. The type is the difference between "this
+      // name exists" and "this name is runnable".
       const dirNames = async (rel) => {
         if (dirCache.has(rel)) return dirCache.get(rel)
-        const names = new Set()
+        const names = new Map()
         try {
           const target = rel === '.' ? rootTarget : await fs.resolve(joinPath(root, rel))
           const entries2 = await fs.listDir(target)
-          for (const e of entries2) names.add(String(e.name).toLowerCase())
+          for (const e of entries2) names.set(String(e.name).toLowerCase(), e.type)
         } catch (e) { /* missing / unreadable → empty */ }
         dirCache.set(rel, names)
         return names
@@ -4650,20 +4658,67 @@ export default {
           }
         }
       }
+      // 6. v1.32.8: the same distribution shape INSIDE a runtime container.
+      // `runtime/python/python.exe` (an embeddable CPython unpacked into a
+      // project folder) is the packaging convention this repo's own runtime
+      // uses, and `PLAIN_EXE_DIRS` listing `runtime` is what the detector was
+      // intended to find. The container name itself tells us nothing, so the
+      // decision has to be made from its CONTENTS — which is why this runs
+      // after `exeRels` is populated and before anything is resolved.
+      for (const rel of exeRels.slice()) {
+        const inner = await dirEntryNames(rel)
+        if (!inner) continue
+        if (PY_DIR_RE.test(String(rel).split('/').pop())) continue
+        await collectPyDirs(rel, inner)
+      }
       // First match wins across the ordered directories; `names` are tried in
       // the order given inside each directory.
+      //
+      // v1.32.8: three rules keep a name collision from producing an unrunnable
+      // command.
+      //   * `accept` takes only entries whose type can actually be executed:
+      //     `file` and `symlink` (fs reports the FOLLOWED type, so POSIX
+      //     `.venv/bin/python` — a link to a real interpreter — still reads as
+      //     `file`), never `directory`.
+      //   * Pass 1 prefers an EXTENSIONED name. `pyExeNames` carries the bare
+      //     `python`/`python3` for POSIX `bin/` shims; on Windows that bare name
+      //     is what matched `runtime/python/`. A `python.exe` anywhere in the
+      //     search order now outranks a bare name.
+      //   * Pass 2 relaxes the name set AND the type filter, then `resolveExe`
+      //     stats the winner and refuses a non-file. The stats never substitute
+      //     for pass 1: these candidates are the run commands' last resort.
+      const isRunnableType = (t) => t === 'file' || t === 'symlink'
       const findLocalExe = async (names) => {
-        for (const rel of exeRels) {
-          const present = await dirNames(rel)
-          if (present.size === 0) continue
-          for (const n of names) {
-            if (present.has(n.toLowerCase())) return { rel: rel === '.' ? n : rel + '/' + n }
+        const search = async (candidates, accept) => {
+          for (const rel of exeRels) {
+            const present = await dirNames(rel)
+            if (present.size === 0) continue
+            for (const n of candidates) {
+              const type = present.get(n.toLowerCase())
+              if (type === undefined || !accept(type)) continue
+              return { rel: rel === '.' ? n : rel + '/' + n }
+            }
           }
+          return null
         }
-        return null
+        const extensioned = names.filter((n) => n.indexOf('.') >= 0)
+        return (await search(extensioned.length > 0 ? extensioned : names, isRunnableType))
+          || (await search(names, () => true))
       }
       // `& ` is required by PowerShell for a quoted path; harmless on POSIX.
       const exeCommand = (absPath) => (TERM_SHELL.dialect === 'pwsh' ? '& ' : '') + '"' + absPath + '"'
+      // A local hit only counts when the ABSOLUTE path really is a file. This
+      // is the terminal guard for the v1.32.8 defect: a directory (or a special
+      // entry) reached through the looser pass-2 name match must degrade to the
+      // PATH fallback instead of being emitted as `& "<dir>" run.py`. `resolve`
+      // + `stat` also follow a link, so a venv shim passes and a context
+      // directory does not.
+      const isRealFileTarget = async (abs) => {
+        try {
+          const info = await fs.stat(await fs.resolve(abs))
+          return !!info && info.type === 'file'
+        } catch (e) { return false }
+      }
       // Resolve one runtime once, then reuse: `command` is either the local
       // absolute path or the bare global name, `source` drives the 本地/全局
       // badge and the local-first ranking, `note` explains it in the picker.
@@ -4671,7 +4726,9 @@ export default {
         const found = await findLocalExe(names)
         if (found) {
           const abs = joinPath(root, found.rel)
-          return { command: exeCommand(abs), source: 'local', note: found.rel, label: found.rel }
+          if (await isRealFileTarget(abs)) {
+            return { command: exeCommand(abs), source: 'local', note: found.rel, label: found.rel }
+          }
         }
         return { command: fallback, source: 'global', note: '', label: fallback }
       }
