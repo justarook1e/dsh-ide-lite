@@ -4,7 +4,7 @@ DSH WebUI 的轻量 IDE 插件：把「文件」和「终端」两个标签页�
 
 > ⚠️ **测试版**：含实验性的文件编辑、撤销/重做与自动保存，请对重要文件与会话数据做好备份。
 >
-> 适配 DSH（deepseek-harness）`dsh-v0.1.5-rc.1`。
+> 适配 DSH（deepseek-harness）`dsh-v0.1.7-rc.2`；host 半区兼容 `0.1.2-alpha.1 .. 0.1.7-rc.2`（`ctx.shell` 的 `run` → `execute` 接缝切换已自动适配）。
 
 ## 功能
 
@@ -29,6 +29,14 @@ pnpm dsh plugin --profile web add @justarook1e/dsh-ide-lite
 ```powershell
 irm https://raw.githubusercontent.com/justarook1e/dsh-ide-lite/main/install.ps1 | iex
 ```
+
+### 桌面端（DeepSeek Harness 桌面应用）
+
+上面两条命令**只对 CLI 的 `web` profile 有效**。桌面应用独占 `~/.dsh/profiles/desktop`（有自己的 `node_modules`、锁文件与 pnpm store），`dsh plugin --profile desktop` 会被 CLI 直接拒绝：`profile "desktop" is managed exclusively by the Electron application`。
+
+桌面端请在**应用内左侧栏的「插件」页**安装同一个包 `@justarook1e/dsh-ide-lite`，然后重启应用。插件包在两端完全一致，**不需要**为桌面端另装一个版本或改任何配置。
+
+> 桌面端 profile 的 `pnpm-workspace.yaml` 由应用生成，没有 `minimumReleaseAge: 0`，刚发布的新版本可能被静默解析成上一版：安装时填精确版本，或在该文件里补一行 `minimumReleaseAge: 0`。
 
 ## 升级
 

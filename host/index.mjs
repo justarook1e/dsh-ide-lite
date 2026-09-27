@@ -86,6 +86,26 @@ export default {
       return
     }
 
+    // v1.32.10: DSH 0.1.7-alpha.1 replaced the shell seam's `run(spec)` with
+    // `execute(spec)` + `ShellExecution.result()`. Both settle the SAME
+    // ShellRunResult (exitCode / signal / stdout / stderr), so only the way the
+    // result is obtained changed. Probe the member rather than the version:
+    //   0.1.2-alpha.1 .. 0.1.6-alpha.2  exposes run(spec)
+    //   0.1.7-alpha.1 .. 0.1.7-rc.2     exposes execute(spec)
+    // No released tag exposes both, and neither ships a compatibility shim, so
+    // the probe is exact rather than merely convenient. execute() throws on
+    // preparation failure or caller cancellation before a process exists;
+    // run(spec) resolved for every outcome except infrastructure failure, so
+    // the caller turns either shape into the same "no result" error path.
+    async function runShellCommand(request) {
+      const spec = shell.resolve(request)
+      if (typeof shell.execute === 'function') {
+        const execution = await shell.execute(spec)
+        return await execution.result()
+      }
+      return await shell.run(spec)
+    }
+
     const MAX_CONTENT_BYTES = 512 * 1024
     // v1.31: the "content in memory" window above which an entry is read as a
     // SIGNATURE instead (see sigFor). Text beyond this stays reviewable and
@@ -2905,13 +2925,20 @@ export default {
       // v1.13.1: same null-policy hazard as writeFile — resolve fresh.
       const policy = freshPolicy(st)
       let result
+      // v1.32.10: the post-0.1.7 seam rejects on preparation failure / caller
+      // cancellation before a process is published, so a result-less failure
+      // now carries a real cause. The old `run` resolved for those outcomes and
+      // only rejected on infrastructure failure; both shapes land here.
+      let shellError = null
       try {
-        result = await shell.run(shell.resolve({ command: command, sandboxPolicy: policy }))
+        result = await runShellCommand({ command: command, sandboxPolicy: policy })
       } catch (e) {
         result = undefined
+        shellError = e
       }
       if (!result || result.exitCode !== 0) {
         const stderr = result && result.stderr && result.stderr.text !== undefined ? String(result.stderr.text) : String((result && result.stderr) || '')
+        if (stderr === '' && shellError) throw new Error('删除失败: ' + (shellError.message || String(shellError)))
         throw new Error('删除失败: ' + stderr)
       }
       // The plugin itself removed a file from disk: notify the client so the
@@ -4900,14 +4927,20 @@ export default {
       const name = exec && exec.name ? exec.name : ''
       // v1.13.3 bugfix: the harness ToolExecution carries the parsed tool
       // arguments under `exec.arguments` (packages/core/tools: ToolExecution),
-      // NOT `exec.args`. Reading `exec.args` yielded undefined, so shell/pwsh
+      // NOT `exec.args`. Reading `exec.args` yielded undefined, so bash/pwsh
       // command text was never inspected (Remove-Item never triggered) and
       // write/edit attribution always fell back to the whole-window sweep.
       const args = exec && (exec.arguments ?? exec.args)
       let mutating = false
       let cmd = ''
       if (name === 'write' || name === 'edit') mutating = true
-      else if (name === 'shell' || name === 'pwsh') {
+      // v1.32.10: the bash tool is named `bash` (packages/shell/tool-bash),
+      // never `shell`, so this gate used to match no real tool and every bash
+      // mutation reached the review only through the git regexes. The
+      // command-text extractor below was already written for the bash dialect
+      // (rm / rmdir / del never consume a flag value), so widening the gate
+      // switches on the existing path.
+      else if (name === 'bash' || name === 'pwsh') {
         // Only commands that can change the workspace trigger a refresh.
         // A command text we cannot inspect is treated as non-mutating
         // (strict per requirement: everything else must not trigger).

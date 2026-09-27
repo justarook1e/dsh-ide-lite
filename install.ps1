@@ -23,6 +23,13 @@
 #
 # After install: restart DSH (loads the new bundle layer), then hard-refresh
 # the web page (Ctrl+F5) so the browser picks up the client bundle.
+#
+# Profile selection:
+#   -ProfileName web       (default) the CLI web profile, installed with
+#                          `dsh plugin --profile web add`.
+#   -ProfileName desktop   NOT installable from here. The Electron desktop app
+#                          owns its own profile and the CLI refuses it by
+#                          design; the script prints the real procedure.
 
 param(
   [switch]$Uninstall,
@@ -52,6 +59,39 @@ function Invoke-Dsh {
   # picked up by the caller via $LASTEXITCODE (never capture it here, or the
   # child's output lines would land in the assignment).
   if ($Inv.Script) { & $Inv.Exe $Inv.Script @Rest } else { & $Inv.Exe @Rest }
+}
+
+# GUI-ONLY PROFILE: the desktop app owns $DSH_HOME/profiles/desktop (its own
+# node_modules, lockfile and pnpm store, separate from profiles/web), and the
+# CLI refuses the name by design -- apps/cli/src/args.ts:
+#   profile "desktop" is managed exclusively by the Electron application
+# Electron also holds a process-lifetime single-instance lock plus a profile
+# transaction lock, so editing that profile from outside is unsafe even where it
+# would appear to work. Explain the real procedure instead of letting the CLI
+# fail with a message that reads like a typo.
+if ($ProfileName -eq 'desktop') {
+  $desktopProfile = Join-Path $env:USERPROFILE '.dsh\profiles\desktop'
+  $desktopWorkspace = Join-Path $desktopProfile 'pnpm-workspace.yaml'
+  ''
+  'The desktop app manages its own profile; it cannot be installed from here.'
+  ''
+  "  profile      $desktopProfile  (Electron-owned)"
+  "  procedure    open DeepSeek Harness, go to the sidebar Plugins page, and"
+  "               install '@justarook1e/dsh-ide-lite' there"
+  ''
+  'Why the command line has no equivalent:'
+  '  * dsh plugin --profile desktop is rejected by design (see above).'
+  '  * profiles/desktop shares no node_modules, lockfile or pnpm store with'
+  '    profiles/web, so installing into web does NOT make it appear here.'
+  '  * The desktop app uses its own bundled Node and pnpm, not the ones this'
+  '    script would call.'
+  ''
+  'The plugin package itself needs no desktop-specific adaptation.'
+  'If a just-published version resolves to an older one, install an exact'
+  'version in the Plugins page, or add a minimumReleaseAge: 0 line to'
+  "  $desktopWorkspace"
+  ''
+  throw 'desktop profile: install from the desktop app''s Plugins page (guidance above)'
 }
 
 $dshInv = Resolve-DshInvocation -Dsh $Dsh
