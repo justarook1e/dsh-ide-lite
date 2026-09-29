@@ -837,6 +837,29 @@ window.__ModuleLoader__.load({
           const uw = getUiWorkspace()
           return !!(uw && typeof uw.startSession === 'function')
         }
+        // v1.32.11: switching sessions is a UI navigation, not a sessions-
+        // service call. DSH moved it to the ui-workspace package's
+        // `uiWorkspace.openSession(target)` ("Select a Session and show its
+        // Conversation as one UI navigation action"); the sessions service's
+        // own contract says "navigation belongs to view owners" and carries NO
+        // `open`. The row handler used to call ctx.sessions.open(id), which
+        // threw `TypeError: ctx.sessions.open is not a function` inside a React
+        // event handler — React swallows that into an uncaught error, so a
+        // click looked like a no-op and NO session could be switched (the
+        // plugin's own sidebar replaces the native browser, so the native rows
+        // were unreachable too). Resolve the live service at click time so an
+        // older DSH still works and a newer one cannot be blocked.
+        const openSessionById = (id) => {
+          if (!id) return false
+          const uw = getUiWorkspace()
+          if (uw && typeof uw.openSession === 'function') { uw.openSession(id); return true }
+          if (ctx.sessions && typeof ctx.sessions.open === 'function') { ctx.sessions.open(id); return true }
+          // Last resort for a layout that kept navigation on the workspace
+          // controller: selecting the workspace that owns the session opens it.
+          const wsvc = ctx.workspaces
+          if (wsvc && typeof wsvc.openSession === 'function') { wsvc.openSession(id); return true }
+          return false
+        }
         const origStartSession = ctx.workspaces && typeof ctx.workspaces.startSession === 'function'
           ? ctx.workspaces.startSession
           : null
@@ -2255,7 +2278,21 @@ window.__ModuleLoader__.load({
                   return React.createElement('div', {
                     key: r.key,
                     className: 'dsh-fe-sess' + (isCur ? ' dsh-fe-sess-cur' : '') + (chkOn ? ' dsh-fe-sess-sel' : '') + (r.leaving ? ' dsh-fe-sess-out' : (r.enter ? ' dsh-fe-sess-in' : '')),
-                    onClick: () => ctx.sessions.open(s.id),
+                    // v1.32.11: open through uiWorkspace.openSession (see
+                    // openSessionById). The failure must not vanish inside the
+                    // event handler: an unmounted/unreachable navigation service
+                    // says so instead of looking like a dead click.
+                    onClick: () => {
+                      try {
+                        if (openSessionById(s.id)) return
+                        showToast('无法切换会话：当前 DSH 版本没有可用的会话导航接口，请更新插件或重启宿主。')
+                        if (console && console.warn) console.warn('[dsh-file-edit] no session-open API on this DSH build; tried uiWorkspace.openSession, sessions.open, workspaces.openSession')
+                      } catch (e) {
+                        const msg = e && e.message ? String(e.message) : String(e)
+                        showToast('切换会话失败：' + msg)
+                        if (console && console.warn) console.warn('[dsh-file-edit] openSession failed: ' + msg)
+                      }
+                    },
                     title: s.id + (s.updatedAt ? '\n' + new Date(s.updatedAt).toLocaleString() : ''),
                   },
                     // v1.20: manage mode swaps the status glyph slot for the
@@ -2432,7 +2469,13 @@ window.__ModuleLoader__.load({
             )
           }
           const byId = sesState ? sesState.byId : {}
-          const currentId = sesState ? sesState.current : undefined
+          // v1.32.11: SessionListState has no `current` member on DSH 0.1.x
+          // (ids / byId / phase / projectionsBySession only), so this used to
+          // be undefined forever and NO row was ever marked as the current
+          // session. Fall back to the plugin's own store, which the session
+          // bar writes from the slot's sessionId prop — the same id the SSE
+          // channel and the new-session guard already trust.
+          const currentId = (sesState && sesState.current) || store.sessionId || undefined
           return React.createElement('div', { className: 'dsh-fe-wsroot' },
             React.createElement('div', { className: 'dsh-fe-wshead' },
               React.createElement('span', null, '工作区'),
